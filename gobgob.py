@@ -32,7 +32,7 @@ TOKEN = "9240200295:AAFLy16Jecm7WtfdJPrzwqcsHG1JiqqlKD8"
 OWNER_ID = 8452462370
 ADMIN_ID = 8452462370
 YOUR_USERNAME = "@freelancertradernahid"
-UPDATE_CHANNEL = "hostifyofficialsbot"
+UPDATE_CHANNEL = "hostifyofficials"
 CHANNEL_INVITE_LINK = "https://t.me/hostifyofficialsbot"
 
 WELCOME_IMAGE_URL = "https://kommodo.ai/i/yzQ8AH5jtwxrGkFQgwRc"
