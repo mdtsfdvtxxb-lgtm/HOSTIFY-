@@ -3,3 +3,4 @@ pyTelegramBotAPI
 psutil
 gunicorn
 requests
+PySocks
