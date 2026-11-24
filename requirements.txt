@@ -1,4 +1,5 @@
 Flask
 pyTelegramBotAPI
 psutil
+gunicorn
 requests
