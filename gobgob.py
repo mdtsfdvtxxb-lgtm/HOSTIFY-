@@ -33,7 +33,7 @@ OWNER_ID = 8452462370
 ADMIN_ID = 8452462370
 YOUR_USERNAME = "@freelancertradernahid"
 UPDATE_CHANNEL = "hostifyofficials"
-CHANNEL_INVITE_LINK = "hostifyofficials"
+CHANNEL_INVITE_LINK = "https://t.me/hostifyofficials"
 
 WELCOME_IMAGE_URL = "https://kommodo.ai/i/yzQ8AH5jtwxrGkFQgwRc"
 
