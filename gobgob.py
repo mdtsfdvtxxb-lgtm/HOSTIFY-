@@ -3,6 +3,7 @@ import atexit
 from datetime import datetime, timedelta
 import hashlib
 import hmac
+import io
 import logging
 import os
 import re
@@ -23,13 +24,18 @@ from telebot import types
 USDT_BDT_RATE = 120.0
 MONETAG_ZONE_ID = "12284632"
 AD_CLAIM_COOLDOWN_HOURS = 24
-MAX_ACCOUNTS_PER_DEVICE = 1  # একই ডিভাইসে সর্বোচ্চ কতটি Telegram অ্যাকাউন্ট অনুমোদিত
+MAX_ACCOUNTS_PER_DEVICE = 1
+STREAK_REWARD_DAYS = 7
+STREAK_BONUS_VIP_DAYS = 1
 
 TOKEN = "9240200295:AAFLy16Jecm7WtfdJPrzwqcsHG1JiqqlKD8"
 OWNER_ID = 8452462370
 ADMIN_ID = 8452462370
 YOUR_USERNAME = "@freelancertradernahid"
-UPDATE_CHANNEL = "hostifyofficials"
+UPDATE_CHANNEL = "hostifyofficialsbot"
+CHANNEL_INVITE_LINK = "https://t.me/hostifyofficialsbot"
+
+WELCOME_IMAGE_URL = "https://kommodo.ai/i/yzQ8AH5jtwxrGkFQgwRc"
 
 BINANCE_API_KEY = "bMp22v6OBD5P3FjfoGxSzDSL3ZPygQn4AxlsiQ7VszNgteNapqbuA83LT4Vu5c1F"
 BINANCE_SECRET_KEY = "A12hNDLKLS5OYtsfK0L6SRGoqlavkowb38cg6ItbdzqD8XjSgLQLkMiwl1YvAqd8"
@@ -39,6 +45,7 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, "upload_bots")
 IROTECH_DIR = os.path.join(BASE_DIR, "inf")
 DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data.db")
+WELCOME_IMAGE_PATH = os.path.join(BASE_DIR, "welcome_banner.jpg")
 DEVICE_PEPPER = hashlib.sha256(f"{TOKEN}:{OWNER_ID}:HOSTIFY_DEVICE_GUARD_V2".encode("utf-8")).hexdigest()
 
 FREE_USER_LIMIT = 0
@@ -60,6 +67,11 @@ admin_ids = {ADMIN_ID, OWNER_ID}
 maintenance_mode = False
 user_last_msg = {}
 pending_bot_tokens = {}
+pending_ticket_users = set()
+pending_admin_replies = {}
+pending_proxy_users = set()
+pending_ai_audit_users = set()
+pending_ai_persona_users = set()
 notified_expiries = set()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -81,10 +93,6 @@ def _extract_client_ip(req):
 
 
 def build_device_fingerprint(user_id=0, req=None, client_dev_id="", extra_sig=""):
-    """
-    Strong multi-signal device fingerprint using persistent client ID,
-    browser/OS headers, optional client telemetry signature, and server pepper.
-    """
     clean_client_id = re.sub(r"[^A-Za-z0-9_.-]", "", str(client_dev_id or "").strip())[:80]
     clean_extra = re.sub(r"[^A-Za-z0-9_.:;,-]", "", str(extra_sig or "").strip())[:160]
     ua = ""
@@ -130,10 +138,6 @@ def log_device_abuse(user_id, existing_owner_id, device_hash, action_type, detai
 
 
 def bind_or_check_device(user_id, device_hash, source="web", enforce_strict=True):
-    """
-    Returns (allowed: bool, conflict_owner_id: int or None, reason_bn: str)
-    Enforces that a device_hash isn't shared across multiple Telegram accounts.
-    """
     if user_id in admin_ids or user_id == OWNER_ID:
         return True, None, ""
     if not device_hash or str(device_hash).startswith("tg_"):
@@ -187,7 +191,6 @@ def bind_or_check_device(user_id, device_hash, source="web", enforce_strict=True
             conn.close()
             return True, None, ""
 
-        # Check if this device_hash already appeared on another user_id previously
         c.execute("SELECT user_id FROM user_devices WHERE device_hash = ? AND user_id != ? LIMIT 1", (device_hash, int(user_id)))
         other_dev = c.fetchone()
         if other_dev:
@@ -210,7 +213,6 @@ def bind_or_check_device(user_id, device_hash, source="web", enforce_strict=True
                 f"এই ডিভাইসটি পূর্বে অন্য একটি Telegram অ্যাকাউন্ট (`{other_uid}`) এর সাথে যুক্ত ছিল।",
             )
 
-        # Lock device to this user
         c.execute(
             "INSERT INTO device_locks (device_hash, owner_user_id, is_blocked, created_at, last_seen) VALUES (?, ?, 0, ?, ?)",
             (device_hash, int(user_id), now_str, now_str),
@@ -314,6 +316,27 @@ def init_db():
             created_at TEXT,
             claimed INTEGER DEFAULT 0
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS support_tickets (
+            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            message_text TEXT,
+            status TEXT DEFAULT 'OPEN',
+            created_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_streaks (
+            user_id INTEGER PRIMARY KEY,
+            streak_count INTEGER DEFAULT 0,
+            last_claim_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_proxies (
+            proxy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            proxy_url TEXT,
+            latency_ms INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 0,
+            created_at TEXT
+        )""")
 
         for alter_sql in [
             "ALTER TABLE subscriptions ADD COLUMN file_limit INTEGER DEFAULT 15",
@@ -372,7 +395,7 @@ init_db()
 load_data()
 
 
-# --- Flask Server with Systemic Motion Graphics Ad Page & Strict Device Guard ---
+# --- Flask Server with Premium Stylist Graphic Motion UI & Strict Device Guard ---
 app = Flask("")
 
 
@@ -412,7 +435,6 @@ def ad_page(token):
         c.execute("SELECT user_id, verified, claimed FROM ad_sessions WHERE token = ?", (token,))
         row = c.fetchone()
         if row:
-            uid = row[0]
             c.execute("UPDATE ad_sessions SET device_hash = ? WHERE token = ?", (soft_dev_hash, token))
             conn.commit()
         conn.close()
@@ -426,17 +448,17 @@ def ad_page(token):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>HOSTIFY ⚡ Systemic Ad & Motion Verification</title>
+        <title>HOSTIFY ✨ Premium VIP Stylist Graphic Motion Engine</title>
         <style>
             :root {{
-                --bg-dark: #050811;
-                --panel-bg: rgba(13, 20, 38, 0.82);
-                --border-glow: rgba(56, 189, 248, 0.35);
+                --bg-dark: #040711;
+                --panel-bg: rgba(12, 19, 38, 0.86);
+                --border-glow: rgba(56, 189, 248, 0.42);
                 --cyan: #38bdf8;
                 --indigo: #818cf8;
                 --emerald: #22c55e;
-                --amber: #f59e0b;
                 --rose: #f43f5e;
+                --amber: #f59e0b;
                 --text-main: #f8fafc;
                 --text-muted: #94a3b8;
             }}
@@ -444,7 +466,7 @@ def ad_page(token):
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
             body {{
-                background: radial-gradient(circle at 20% 20%, #0f172a 0%, var(--bg-dark) 65%);
+                background: radial-gradient(circle at 15% 20%, #0f172a 0%, var(--bg-dark) 68%);
                 color: var(--text-main);
                 font-family: 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
                 min-height: 100vh;
@@ -456,57 +478,55 @@ def ad_page(token):
                 position: relative;
             }}
 
-            /* Systemic Animated Background Grid & Orbs */
             .sys-grid {{
                 position: fixed;
                 inset: 0;
                 background-image:
-                    linear-gradient(rgba(56, 189, 248, 0.06) 1px, transparent 1px),
-                    linear-gradient(90deg, rgba(129, 140, 248, 0.06) 1px, transparent 1px);
-                background-size: 38px 38px;
-                animation: gridDrift 18s linear infinite;
+                    linear-gradient(rgba(56, 189, 248, 0.07) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(129, 140, 248, 0.07) 1px, transparent 1px);
+                background-size: 36px 36px;
+                animation: gridDrift 16s linear infinite;
                 z-index: 0;
                 pointer-events: none;
             }}
 
             @keyframes gridDrift {{
                 0% {{ transform: translate(0, 0); }}
-                100% {{ transform: translate(38px, 38px); }}
+                100% {{ transform: translate(36px, 36px); }}
             }}
 
             .orb {{
                 position: fixed;
                 border-radius: 50%;
-                filter: blur(70px);
-                opacity: 0.35;
+                filter: blur(72px);
+                opacity: 0.36;
                 z-index: 0;
                 pointer-events: none;
-                animation: orbFloat 9s ease-in-out infinite alternate;
+                animation: orbFloat 8s ease-in-out infinite alternate;
             }}
-            .orb-1 {{ width: 260px; height: 260px; background: #0284c7; top: -60px; left: -50px; }}
-            .orb-2 {{ width: 300px; height: 300px; background: #4f46e5; bottom: -80px; right: -60px; animation-delay: 2s; }}
-            .orb-3 {{ width: 180px; height: 180px; background: #10b981; top: 55%; left: 65%; animation-delay: 4s; }}
+            .orb-1 {{ width: 270px; height: 270px; background: #0284c7; top: -60px; left: -50px; }}
+            .orb-2 {{ width: 310px; height: 310px; background: #6366f1; bottom: -80px; right: -60px; animation-delay: 2s; }}
+            .orb-3 {{ width: 190px; height: 190px; background: #10b981; top: 52%; left: 64%; animation-delay: 3.5s; }}
 
             @keyframes orbFloat {{
                 0% {{ transform: translate(0, 0) scale(1); }}
-                100% {{ transform: translate(22px, -28px) scale(1.12); }}
+                100% {{ transform: translate(24px, -28px) scale(1.14); }}
             }}
 
-            /* Motion Card Container */
             .card {{
                 position: relative;
                 z-index: 2;
                 background: var(--panel-bg);
-                backdrop-filter: blur(18px);
-                -webkit-backdrop-filter: blur(18px);
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
                 padding: 28px 22px;
-                border-radius: 24px;
-                max-width: 460px;
+                border-radius: 26px;
+                max-width: 470px;
                 width: 100%;
                 border: 1px solid var(--border-glow);
-                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.65), 0 0 30px rgba(56, 189, 248, 0.12);
+                box-shadow: 0 24px 65px rgba(0, 0, 0, 0.72), 0 0 34px rgba(56, 189, 248, 0.16);
                 text-align: center;
-                animation: cardEntrance 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                animation: cardEntrance 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
                 overflow: hidden;
             }}
 
@@ -514,13 +534,13 @@ def ad_page(token):
                 content: "";
                 position: absolute;
                 top: 0; left: -100%;
-                width: 100%; height: 2px;
-                background: linear-gradient(90deg, transparent, var(--cyan), var(--indigo), transparent);
-                animation: scanLine 3.2s linear infinite;
+                width: 100%; height: 2.5px;
+                background: linear-gradient(90deg, transparent, var(--cyan), var(--amber), var(--indigo), transparent);
+                animation: scanLine 3s linear infinite;
             }}
 
             @keyframes cardEntrance {{
-                0% {{ opacity: 0; transform: translateY(28px) scale(0.96); }}
+                0% {{ opacity: 0; transform: translateY(30px) scale(0.95); }}
                 100% {{ opacity: 1; transform: translateY(0) scale(1); }}
             }}
 
@@ -529,11 +549,10 @@ def ad_page(token):
                 100% {{ left: 100%; }}
             }}
 
-            /* SVG Motion Core */
             .motion-stage {{
                 position: relative;
-                width: 112px;
-                height: 112px;
+                width: 118px;
+                height: 118px;
                 margin: 0 auto 14px;
                 display: flex;
                 align-items: center;
@@ -544,47 +563,46 @@ def ad_page(token):
                 position: absolute;
                 inset: 6px;
                 border-radius: 50%;
-                border: 2px solid rgba(56, 189, 248, 0.45);
-                animation: radarPulse 2.4s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+                border: 2px solid rgba(56, 189, 248, 0.5);
+                animation: radarPulse 2.3s cubic-bezier(0.24, 0, 0.38, 1) infinite;
             }}
             .pulse-ring:nth-child(2) {{
-                animation-delay: 1.2s;
-                border-color: rgba(129, 140, 248, 0.4);
+                animation-delay: 1.15s;
+                border-color: rgba(129, 140, 248, 0.45);
             }}
 
             @keyframes radarPulse {{
-                0% {{ transform: scale(0.82); opacity: 0.9; }}
-                100% {{ transform: scale(1.38); opacity: 0; }}
+                0% {{ transform: scale(0.8); opacity: 0.92; }}
+                100% {{ transform: scale(1.42); opacity: 0; }}
             }}
 
             svg.motion-svg {{
-                width: 96px;
-                height: 96px;
+                width: 102px;
+                height: 102px;
                 position: relative;
                 z-index: 2;
             }}
 
             .spin-slow {{
                 transform-origin: 48px 48px;
-                animation: spin360 12s linear infinite;
+                animation: spin360 11s linear infinite;
             }}
             .spin-reverse {{
                 transform-origin: 48px 48px;
-                animation: spinReverse 7s linear infinite;
+                animation: spinReverse 6.5s linear infinite;
             }}
             .core-beat {{
                 transform-origin: 48px 48px;
-                animation: coreBeat 1.8s ease-in-out infinite;
+                animation: coreBeat 1.7s ease-in-out infinite;
             }}
 
             @keyframes spin360 {{ to {{ transform: rotate(360deg); }} }}
             @keyframes spinReverse {{ to {{ transform: rotate(-360deg); }} }}
             @keyframes coreBeat {{
                 0%, 100% {{ transform: scale(0.94); }}
-                50% {{ transform: scale(1.08); }}
+                50% {{ transform: scale(1.09); }}
             }}
 
-            /* Systemic Telemetry Pills */
             .telemetry-bar {{
                 display: flex;
                 justify-content: center;
@@ -597,8 +615,8 @@ def ad_page(token):
                 font-size: 11px;
                 padding: 4px 10px;
                 border-radius: 999px;
-                background: rgba(30, 41, 59, 0.85);
-                border: 1px solid rgba(148, 163, 184, 0.22);
+                background: rgba(30, 41, 59, 0.88);
+                border: 1px solid rgba(148, 163, 184, 0.25);
                 color: #bae6fd;
                 display: inline-flex;
                 align-items: center;
@@ -610,7 +628,7 @@ def ad_page(token):
                 border-radius: 50%;
                 background: var(--emerald);
                 box-shadow: 0 0 8px var(--emerald);
-                animation: blinkDot 1.3s infinite;
+                animation: blinkDot 1.2s infinite;
             }}
 
             @keyframes blinkDot {{
@@ -621,17 +639,17 @@ def ad_page(token):
             h2 {{
                 font-size: 20px;
                 letter-spacing: 0.4px;
-                background: linear-gradient(90deg, #38bdf8, #a5b4fc, #34d399);
-                background-size: 200% auto;
+                background: linear-gradient(90deg, #38bdf8, #fbbf24, #a5b4fc, #34d399);
+                background-size: 220% auto;
                 -webkit-background-clip: text;
                 -webkit-text-fill-color: transparent;
-                animation: textShimmer 4s linear infinite;
+                animation: textShimmer 3.8s linear infinite;
                 margin-bottom: 8px;
             }}
 
             @keyframes textShimmer {{
                 0% {{ background-position: 0% center; }}
-                100% {{ background-position: 200% center; }}
+                100% {{ background-position: 220% center; }}
             }}
 
             p.desc {{
@@ -641,27 +659,25 @@ def ad_page(token):
                 margin-bottom: 14px;
             }}
 
-            /* Animated Progress Track */
             .progress-box {{
                 width: 100%;
                 height: 8px;
-                background: rgba(15, 23, 42, 0.9);
+                background: rgba(15, 23, 42, 0.92);
                 border-radius: 999px;
                 overflow: hidden;
-                border: 1px solid rgba(56, 189, 248, 0.2);
+                border: 1px solid rgba(56, 189, 248, 0.24);
                 margin: 12px 0 18px;
             }}
 
             .progress-fill {{
                 height: 100%;
                 width: 0%;
-                background: linear-gradient(90deg, #0284c7, #38bdf8, #22c55e);
+                background: linear-gradient(90deg, #0284c7, #38bdf8, #fbbf24, #22c55e);
                 border-radius: 999px;
                 transition: width 0.35s ease;
-                box-shadow: 0 0 14px rgba(56, 189, 248, 0.6);
+                box-shadow: 0 0 16px rgba(56, 189, 248, 0.65);
             }}
 
-            /* Motion Button */
             .btn {{
                 position: relative;
                 width: 100%;
@@ -675,12 +691,12 @@ def ad_page(token):
                 cursor: pointer;
                 overflow: hidden;
                 transition: transform 0.2s ease, box-shadow 0.2s ease;
-                box-shadow: 0 10px 25px rgba(14, 165, 233, 0.35);
+                box-shadow: 0 10px 25px rgba(14, 165, 233, 0.38);
             }}
 
             .btn:hover:not(:disabled) {{
                 transform: translateY(-2px) scale(1.01);
-                box-shadow: 0 14px 30px rgba(56, 189, 248, 0.5);
+                box-shadow: 0 14px 30px rgba(56, 189, 248, 0.52);
             }}
 
             .btn:active:not(:disabled) {{
@@ -692,9 +708,9 @@ def ad_page(token):
                 position: absolute;
                 top: 0; left: -120%;
                 width: 60%; height: 100%;
-                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.36), transparent);
                 transform: skewX(-20deg);
-                animation: btnSheen 3.5s infinite;
+                animation: btnSheen 3.2s infinite;
             }}
 
             @keyframes btnSheen {{
@@ -744,21 +760,21 @@ def ad_page(token):
                 <div class="pulse-ring"></div>
                 <div class="pulse-ring"></div>
                 <svg class="motion-svg" viewBox="0 0 96 96" fill="none">
-                    <circle class="spin-slow" cx="48" cy="48" r="42" stroke="#38bdf8" stroke-width="2" stroke-dasharray="10 8" opacity="0.75"/>
-                    <circle class="spin-reverse" cx="48" cy="48" r="32" stroke="#818cf8" stroke-width="2" stroke-dasharray="16 10" opacity="0.85"/>
+                    <circle class="spin-slow" cx="48" cy="48" r="42" stroke="#38bdf8" stroke-width="2" stroke-dasharray="10 8" opacity="0.8"/>
+                    <circle class="spin-reverse" cx="48" cy="48" r="32" stroke="#818cf8" stroke-width="2" stroke-dasharray="16 10" opacity="0.88"/>
                     <g class="core-beat">
-                        <polygon points="48,22 70,35 70,61 48,74 26,61 26,35" fill="rgba(14, 165, 233, 0.16)" stroke="#38bdf8" stroke-width="2"/>
+                        <polygon points="48,22 70,35 70,61 48,74 26,61 26,35" fill="rgba(14, 165, 233, 0.18)" stroke="#fbbf24" stroke-width="2"/>
                         <path d="M40 48L46 54L57 42" stroke="#22c55e" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
                     </g>
                 </svg>
             </div>
 
             <div class="telemetry-bar">
-                <span class="pill"><span class="dot-live"></span> SYSTEMIC GUARD ACTIVE</span>
+                <span class="pill"><span class="dot-live"></span> VIP MOTION ENGINE</span>
                 <span class="pill" id="devBadge">🔒 DEVICE LOCKED</span>
             </div>
 
-            <h2>🚀 HOSTIFY SYSTEMIC AD ENGINE</h2>
+            <h2>✨ HOSTIFY VIP STYLIST MOTION</h2>
             <p class="desc">
                 ফ্রি VIP ক্লেইম করতে নিচের <b>Watch Ad Now</b> বাটনে ক্লিক করে অ্যাডটি সম্পন্ন করুন।
                 ভেরিফাই হলে বোটে ফিরে গিয়ে <b>Verify Ad &amp; Claim VIP</b> চাপুন।
@@ -770,7 +786,7 @@ def ad_page(token):
 
             <button id="adBtn" class="btn" onclick="startAd()">👀 Watch Ad Now</button>
             <div id="statusMsg" class="status"></div>
-            <div class="shield-note">🛡️ Multi-Account &amp; Fingerprint Protection Enabled</div>
+            <div class="shield-note">🛡️ Stylist Motion &amp; Multi-Account Guard Enabled</div>
         </div>
 
         <script>
@@ -964,6 +980,25 @@ def is_anti_flood(uid):
         return True
     user_last_msg[uid] = now
     return False
+
+
+def play_stylist_animation(message, title="VIP MOTION ENGINE", frames=None):
+    frames = frames or [
+        f"✨ **[▰▱▱▱▱] {title}** — _Initializing..._",
+        f"💎 **[▰▰▰▱▱] {title}** — _Syncing Core..._",
+        f"🚀 **[▰▰▰▰▰] {title}** — _Ready!_",
+    ]
+    try:
+        sent = bot.reply_to(message, frames[0], parse_mode="Markdown")
+        for fr in frames[1:]:
+            time.sleep(0.25)
+            try:
+                bot.edit_message_text(fr, sent.chat.id, sent.message_id, parse_mode="Markdown")
+            except Exception:
+                pass
+        return sent
+    except Exception:
+        return None
 
 
 def parse_price_to_usdt(price_str):
@@ -1241,16 +1276,46 @@ def check_binance_payment(pay_order_id):
         return False, 0.0, f"Error: {e}"
 
 
+def get_channel_url():
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    clean_ch = str(UPDATE_CHANNEL).lstrip("@")
+    return f"https://t.me/{clean_ch}"
+
+
 def check_force_sub(user_id):
     if user_id in admin_ids:
         return True
     try:
-        channel_target = f"@{UPDATE_CHANNEL}" if not str(UPDATE_CHANNEL).startswith(("@", "-100")) else str(UPDATE_CHANNEL)
+        channel_target = (
+            f"@{UPDATE_CHANNEL}"
+            if not str(UPDATE_CHANNEL).startswith(("@", "-100"))
+            else str(UPDATE_CHANNEL)
+        )
         member = bot.get_chat_member(channel_target, user_id)
         return member.status in ["member", "administrator", "creator", "restricted"]
     except Exception as e:
         logger.error(f"Force Sub Check Error for {user_id}: {e}")
         return False
+
+
+def send_welcome_banner(chat_id, caption_text, reply_markup=None):
+    if WELCOME_IMAGE_URL:
+        try:
+            bot.send_photo(chat_id, WELCOME_IMAGE_URL, caption=caption_text, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        except Exception as e:
+            logger.warning(f"Welcome image URL send failed, trying local backup: {e}")
+
+    if os.path.exists(WELCOME_IMAGE_PATH):
+        try:
+            with open(WELCOME_IMAGE_PATH, "rb") as img_f:
+                bot.send_photo(chat_id, img_f, caption=caption_text, reply_markup=reply_markup, parse_mode="Markdown")
+            return
+        except Exception as e:
+            logger.warning(f"Local welcome image send failed, falling back to text: {e}")
+
+    bot.send_message(chat_id, caption_text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 def get_user_folder(user_id):
@@ -1313,6 +1378,18 @@ def cleanup_all_scripts():
 atexit.register(cleanup_all_scripts)
 
 
+def get_active_proxy_for_user(uid):
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT proxy_url FROM user_proxies WHERE user_id = ? AND is_active = 1 LIMIT 1", (int(uid),))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
 def run_script(script_path, owner_id, folder, fname, msg=None, bot_api_token=""):
     skey = f"{owner_id}_{fname}"
     if skey in bot_scripts:
@@ -1324,6 +1401,11 @@ def run_script(script_path, owner_id, folder, fname, msg=None, bot_api_token="")
         if bot_api_token:
             env["BOT_TOKEN"] = bot_api_token
             env["TELEGRAM_BOT_TOKEN"] = bot_api_token
+        active_px = get_active_proxy_for_user(owner_id)
+        if active_px:
+            env["HTTP_PROXY"] = active_px
+            env["HTTPS_PROXY"] = active_px
+            env["ALL_PROXY"] = active_px
         proc = subprocess.Popen(
             [sys.executable, script_path],
             cwd=folder,
@@ -1345,7 +1427,8 @@ def run_script(script_path, owner_id, folder, fname, msg=None, bot_api_token="")
             "auto_restart": True,
         }
         if msg:
-            bot.reply_to(msg, f"🚀 **PYTHON BOT STARTED!**\n📄 File: `{fname}`\n🆔 PID: `{proc.pid}`", parse_mode="Markdown")
+            px_line = f"\n🌐 Proxy: `{active_px}`" if active_px else ""
+            bot.reply_to(msg, f"🚀 **PYTHON BOT STARTED!**\n📄 File: `{fname}`\n🆔 PID: `{proc.pid}`{px_line}", parse_mode="Markdown")
     except Exception as e:
         if msg:
             bot.reply_to(msg, f"❌ Start Error: {e}")
@@ -1362,6 +1445,11 @@ def run_js_script(script_path, owner_id, folder, fname, msg=None, bot_api_token=
         if bot_api_token:
             env["BOT_TOKEN"] = bot_api_token
             env["TELEGRAM_BOT_TOKEN"] = bot_api_token
+        active_px = get_active_proxy_for_user(owner_id)
+        if active_px:
+            env["HTTP_PROXY"] = active_px
+            env["HTTPS_PROXY"] = active_px
+            env["ALL_PROXY"] = active_px
         proc = subprocess.Popen(
             ["node", script_path],
             cwd=folder,
@@ -1383,7 +1471,8 @@ def run_js_script(script_path, owner_id, folder, fname, msg=None, bot_api_token=
             "auto_restart": True,
         }
         if msg:
-            bot.reply_to(msg, f"🚀 **NODE.JS BOT STARTED!**\n📄 File: `{fname}`\n🆔 PID: `{proc.pid}`", parse_mode="Markdown")
+            px_line = f"\n🌐 Proxy: `{active_px}`" if active_px else ""
+            bot.reply_to(msg, f"🚀 **NODE.JS BOT STARTED!**\n📄 File: `{fname}`\n🆔 PID: `{proc.pid}`{px_line}", parse_mode="Markdown")
     except Exception as e:
         if msg:
             bot.reply_to(msg, f"❌ JS Start Error: {e}")
@@ -1474,13 +1563,19 @@ def main_menu_markup(uid):
     rows = [
         ["📢 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹", "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴"],
         ["🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗕𝗼𝘁", "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗕𝗼𝘁𝘀"],
+        ["🩺 𝗕𝗼𝘁 𝗛𝗲𝗮𝗹𝘁𝗵", "💾 𝗕𝗮𝗰𝗸𝘂𝗽"],
+        ["🔥 𝗗𝗮𝗶𝗹𝘆 𝗦𝘁𝗿𝗲𝗮𝗸", "🌐 𝗣𝗿𝗼𝘅𝘆 𝗩𝗮𝘂𝗹𝘁"],
+        ["🧪 𝗣𝗿𝗼𝘅𝘆 𝗧𝗲𝘀𝘁", "🔄 𝗥𝗼𝘁𝗮𝘁𝗲 𝗣𝗿𝗼𝘅𝘆"],
+        ["✨ 𝗦𝘁𝘆𝗹𝗶𝘀𝘁 𝗖𝗮𝗿𝗱", "🛡️ 𝗩𝗜𝗣 𝗦𝗵𝗶𝗲𝗹𝗱"],
+        ["🤖 𝗔𝗜 𝗖𝗼𝗱𝗲 𝗔𝘂𝗱𝗶𝘁", "🧠 𝗔𝗜 𝗟𝗼𝗴 𝗗𝗼𝗰"],
+        ["✨ 𝗔𝗜 𝗦𝘁𝘆𝗹𝗶𝘀𝘁", "🔮 𝗔𝗜 𝗣𝗿𝗲𝗱𝗶𝗰𝘁"],
         ["💳 𝗩𝗶𝗲𝘄 𝗣𝗹𝗮𝗻𝘀", "🎁 𝗘𝗮𝗿𝗻 𝗩𝗜𝗣"],
         ["🎟️ 𝗥𝗲𝗱𝗲𝗲𝗺 𝗖𝗼𝗱𝗲", "🔗 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹"],
-        ["👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲", "💬 𝗦𝘂𝗽𝗽𝗼𝗿𝘁"],
-        ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
+        ["👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲", "🆘 𝗧𝗶𝗰𝗸𝗲𝘁"],
+        ["💬 𝗦𝘂𝗽𝗽𝗼𝗿𝘁", "👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
     ]
     if uid in admin_ids:
-        rows.insert(4, ["🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹", "📊 𝗦𝘆𝘀𝘁𝗲𝗺 𝗦𝘁𝗮𝘁𝘀"])
+        rows.insert(10, ["🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹", "📊 𝗦𝘆𝘀𝘁𝗲𝗺 𝗦𝘁𝗮𝘁𝘀"])
     for r in rows:
         markup.add(*[types.KeyboardButton(t) for t in r])
     return markup
@@ -1527,6 +1622,583 @@ def admin_panel_markup():
     return m
 
 
+# --- 10 Premium / VIP / Proxy / Smart / Stylist Features ---
+def _logic_proxy_vault(message):
+    uid = message.from_user.id
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT proxy_id, proxy_url, latency_ms, is_active FROM user_proxies WHERE user_id = ? ORDER BY proxy_id DESC", (uid,))
+    rows = c.fetchall()
+    conn.close()
+
+    pending_proxy_users.add(uid)
+    lines = [f"🌐 **PROXY VAULT (`{uid}`)**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("ℹ️ এখনো কোনো প্রক্সি সেভ করা নেই।")
+    else:
+        for pid, purl, lat, act in rows[:10]:
+            st = "🟢 Active" if int(act or 0) == 1 else "⚪ Standby"
+            lines.append(f"• `#{pid}` `{purl}` — `{lat}ms` | {st}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("➕ নতুন প্রক্সি যোগ করতে `http://ip:port` বা `socks5://ip:port` লিখে পাঠান *(বাতিল করতে `cancel`)*।")
+    msg = bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_add_proxy)
+
+
+def process_add_proxy(message):
+    uid = message.from_user.id
+    pending_proxy_users.discard(uid)
+    raw = (message.text or "").strip()
+    if not raw or raw.lower() == "cancel":
+        bot.reply_to(message, "❌ Proxy Vault ইনপুট বাতিল করা হয়েছে।")
+        return
+    if not re.match(r"^(https?|socks5h?)://[\w.-]+:\d+$", raw, re.IGNORECASE):
+        bot.reply_to(message, "⚠️ সঠিক প্রক্সি ফরম্যাট দিন, যেমন: `http://127.0.0.1:8080` বা `socks5://user:pass@host:1080`।", parse_mode="Markdown")
+        return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("UPDATE user_proxies SET is_active = 0 WHERE user_id = ?", (uid,))
+        c.execute(
+            "INSERT INTO user_proxies (user_id, proxy_url, latency_ms, is_active, created_at) VALUES (?, ?, 0, 1, ?)",
+            (uid, raw, datetime.now().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    bot.reply_to(message, f"✅ প্রক্সি সেভ ও Active করা হয়েছে:\n`{raw}`", parse_mode="Markdown")
+
+
+def _logic_proxy_test(message):
+    uid = message.from_user.id
+    play_stylist_animation(message, "SMART PROXY TESTER")
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT proxy_id, proxy_url, is_active FROM user_proxies WHERE user_id = ?", (uid,))
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        bot.reply_to(message, "🧪 টেস্ট করার মতো কোনো প্রক্সি পাওয়া যায়নি। আগে **🌐 𝗣𝗿𝗼𝘅𝘆 𝗩𝗮𝘂𝗹𝘁** এ প্রক্সি যোগ করুন।", parse_mode="Markdown")
+        return
+
+    lines = ["🧪 **SMART PROXY DIAGNOSTICS**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for pid, purl, act in rows[:8]:
+        t0 = time.time()
+        ok = False
+        try:
+            r = requests.get("https://api.telegram.org", proxies={"http": purl, "https": purl}, timeout=4)
+            ok = r.status_code in (200, 301, 302, 404)
+        except Exception:
+            ok = False
+        ms = int((time.time() - t0) * 1000)
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("UPDATE user_proxies SET latency_ms = ? WHERE proxy_id = ?", (ms, pid))
+            conn.commit()
+            conn.close()
+        badge = "🟢 Online" if ok else "🔴 Timeout/Err"
+        act_tag = " [ACTIVE]" if int(act or 0) == 1 else ""
+        lines.append(f"• `#{pid}` `{purl}`{act_tag}\n  Status: {badge} | Latency: `{ms}ms`")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+def _logic_rotate_proxy(message):
+    uid = message.from_user.id
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT proxy_id, proxy_url, is_active FROM user_proxies WHERE user_id = ? ORDER BY proxy_id ASC", (uid,))
+    rows = c.fetchall()
+    conn.close()
+
+    if len(rows) < 2:
+        bot.reply_to(message, "🔄 রোটেশন করার জন্য অন্তত ২টি প্রক্সি প্রয়োজন। **🌐 𝗣𝗿𝗼𝘅𝘆 𝗩𝗮𝘂𝗹𝘁** থেকে আরও প্রক্সি যোগ করুন।", parse_mode="Markdown")
+        return
+
+    active_idx = 0
+    for idx, r in enumerate(rows):
+        if int(r[3] if len(r) > 3 else r[2]) == 1:
+            active_idx = idx
+            break
+    next_row = rows[(active_idx + 1) % len(rows)]
+    next_id, next_url = next_row[0], next_row[1]
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("UPDATE user_proxies SET is_active = 0 WHERE user_id = ?", (uid,))
+        c.execute("UPDATE user_proxies SET is_active = 1 WHERE proxy_id = ?", (next_id,))
+        conn.commit()
+        conn.close()
+
+    bot.reply_to(
+        message,
+        f"🔄 **AUTO PROXY ROTATED!**\n"
+        f"🌐 New Active Proxy (`#{next_id}`): `{next_url}`\n"
+        f"⚡ নতুন বট চালু বা রিস্টার্ট করলে এই প্রক্সিটি `HTTP_PROXY` / `HTTPS_PROXY` হিসেবে ইনজেক্ট হবে।",
+        parse_mode="Markdown",
+    )
+
+
+def _logic_stylist_card(message):
+    uid = message.from_user.id
+    play_stylist_animation(message, "STYLIST VIP CARD")
+    sub = user_subscriptions.get(uid)
+    is_vip = bool(sub and sub["expiry"] > datetime.now())
+    tier = "👑 OWNER" if uid == OWNER_ID else ("🛡️ ADMIN" if uid in admin_ids else ("💎 VIP" if is_vip else "🆓 FREE"))
+    px = get_active_proxy_for_user(uid) or "Direct (No Proxy)"
+    flist = user_files.get(uid, [])
+    running_cnt = sum(1 for fn, _ in flist if is_bot_running(uid, fn))
+
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT streak_count FROM daily_streaks WHERE user_id = ?", (uid,))
+    srow = c.fetchone()
+    streak = int(srow[0] or 0) if srow else 0
+    conn.close()
+
+    card = (
+        f"✨ ╔══════════════════════════╗ ✨\n"
+        f"      **HOSTIFY VIP STYLIST CARD**\n"
+        f"✨ ╚══════════════════════════╝ ✨\n"
+        f"👤 **User:** `{message.from_user.first_name}` (`{uid}`)\n"
+        f"🏅 **Tier:** `{tier}`\n"
+        f"🔥 **Streak:** `{streak}` দিন\n"
+        f"🚀 **Bots:** `{running_cnt}/{len(flist)}` Running (Limit: `{get_user_file_limit(uid)}`)\n"
+        f"🌐 **Proxy:** `{px}`\n"
+        f"⚡ **Node Load:** CPU `{psutil.cpu_percent()}%` | RAM `{psutil.virtual_memory().percent}%`"
+    )
+    bot.reply_to(message, card, parse_mode="Markdown")
+
+
+def _logic_vip_shield(message):
+    uid = message.from_user.id
+    flist = user_files.get(uid, [])
+    shielded = 0
+    for fn, _ in flist:
+        skey = f"{uid}_{fn}"
+        if skey in bot_scripts:
+            bot_scripts[skey]["auto_restart"] = True
+            shielded += 1
+    bot.reply_to(
+        message,
+        f"🛡️ **VIP ANTI-CRASH SHIELD ACTIVE**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Auto-Restart Guard Enabled on `{shielded}` active bot(s).\n"
+        f"🔁 কোনো বট ক্র্যাশ করলে ২০ সেকেন্ডের মধ্যে অটোমেটিক রিস্টার্ট হবে।",
+        parse_mode="Markdown",
+    )
+
+
+# --- 10 Premium / VIP / Proxy / Smart / Unique / Stylist AI Features ---
+def _logic_ai_code_audit(message):
+    uid = message.from_user.id
+    pending_ai_audit_users.add(uid)
+    msg = bot.reply_to(
+        message,
+        "🤖 **AI CODE AUDITOR**\n"
+        "যে বট ফাইলের AI অডিট চান সেটির নাম লিখুন (যেমন: `bot.py`) অথবা সরাসরি Python/JS কোড পেস্ট করুন *(বাতিল করতে `cancel`)*:",
+        parse_mode="Markdown",
+    )
+    bot.register_next_step_handler(msg, process_ai_code_audit)
+
+
+def process_ai_code_audit(message):
+    uid = message.from_user.id
+    pending_ai_audit_users.discard(uid)
+    raw = (message.text or "").strip()
+    if not raw or raw.lower() == "cancel":
+        bot.reply_to(message, "❌ AI Code Audit বাতিল করা হয়েছে।")
+        return
+
+    folder = get_user_folder(uid)
+    candidate_path = os.path.join(folder, os.path.basename(raw))
+    if os.path.exists(candidate_path) and os.path.isfile(candidate_path):
+        with open(candidate_path, "r", encoding="utf-8", errors="ignore") as f:
+            code_src = f.read()
+        target_label = os.path.basename(raw)
+    else:
+        code_src = raw
+        target_label = "Pasted Snippet"
+
+    findings = []
+    score = 95
+    if re.search(r"\d{8,10}:[A-Za-z0-9_-]{35}", code_src):
+        findings.append("⚠️ হার্ডকোডেড Telegram Bot Token পাওয়া গেছে — `os.environ.get('BOT_TOKEN')` ব্যবহার করুন।")
+        score -= 20
+    if "eval(" in code_src or "exec(" in code_src:
+        findings.append("🚨 `eval()` বা `exec()` ব্যবহার করা হয়েছে — নিরাপত্তা ঝুঁকি থাকতে পারে।")
+        score -= 25
+    if "while True:" in code_src and "sleep" not in code_src:
+        findings.append("⚡ `while True:` লুপে `time.sleep()` নেই — CPU স্পাইক হতে পারে।")
+        score -= 15
+    if "except:" in code_src:
+        findings.append("💡 Bare `except:` ব্লক রয়েছে — নির্দিষ্ট Exception হ্যান্ডেল করা উত্তম।")
+        score -= 10
+    if not findings:
+        findings.append("✅ কোনো গুরুতর কোড বা সিকিউরিটি ত্রুটি পাওয়া যায়নি।")
+
+    score = max(10, score)
+    report = (
+        f"🤖 **AI CODE AUDIT REPORT (`{target_label}`)**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 **AI Health Score:** `{score}/100`\n"
+        f"🔍 **Findings:**\n" + "\n".join(f"• {x}" for x in findings)
+    )
+    bot.reply_to(message, report, parse_mode="Markdown")
+
+
+def _logic_ai_log_doc(message):
+    uid = message.from_user.id
+    flist = user_files.get(uid, [])
+    folder = get_user_folder(uid)
+    if not flist:
+        bot.reply_to(message, "🧠 বিশ্লেষণ করার মতো কোনো বট ফাইল বা লগ পাওয়া যায়নি।")
+        return
+
+    lines = ["🧠 **AI LOG ERROR DOCTOR**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for fname, _ in flist[:6]:
+        log_path = os.path.join(folder, f"{os.path.splitext(fname)[0]}.log")
+        if not os.path.exists(log_path):
+            lines.append(f"• `{fname}`: কোনো লগ ফাইল নেই।")
+            continue
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as lf:
+            tail = lf.read()[-3000:]
+        diag = "✅ Healthy — কোনো ক্র্যাশ/এরর নেই।"
+        if "ModuleNotFoundError" in tail or "No module named" in tail:
+            diag = "❌ Missing Package (`ModuleNotFoundError`) — `requirements.txt` বা প্যাকেজ ইনস্টল করুন।"
+        elif "SyntaxError" in tail or "IndentationError" in tail:
+            diag = "❌ Syntax/Indentation Error — কোডের ইন্ডেন্টেশন ও সিনট্যাক্স চেক করুন।"
+        elif "Conflict: terminated by other getUpdates" in tail:
+            diag = "⚠️ Telegram Polling Conflict — একই টোকেন দিয়ে অন্য কোথাও বট চলছে।"
+        elif "401 Unauthorized" in tail:
+            diag = "🔑 Invalid Bot Token (`401`) — সঠিক BotFather টোকেন দিন।"
+        lines.append(f"• `{fname}`:\n  {diag}")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+def _logic_ai_stylist(message):
+    uid = message.from_user.id
+    pending_ai_persona_users.add(uid)
+    msg = bot.reply_to(
+        message,
+        "✨ **AI STYLIST & PERSONA STUDIO**\n"
+        "আপনার বটের নাম বা যেকোনো মেসেজ পাঠান — AI সেটিকে **VIP Stylist** ফরম্যাটে সাজিয়ে দেবে *(বাতিল করতে `cancel`)*:",
+        parse_mode="Markdown",
+    )
+    bot.register_next_step_handler(msg, process_ai_stylist)
+
+
+def process_ai_stylist(message):
+    uid = message.from_user.id
+    pending_ai_persona_users.discard(uid)
+    txt = (message.text or "").strip()
+    if not txt or txt.lower() == "cancel":
+        bot.reply_to(message, "❌ AI Stylist Studio বাতিল করা হয়েছে।")
+        return
+
+    styled = (
+        f"✨ **━━━━━━━━━━━━━━━━━━━━━** ✨\n"
+        f"💎 **VIP STYLIST EDITION**\n"
+        f"✨ **━━━━━━━━━━━━━━━━━━━━━** ✨\n"
+        f"🔹 {txt}\n"
+        f"⚡ *Powered by HOSTIFY Cloud & AI*"
+    )
+    bot.reply_to(message, styled, parse_mode="Markdown")
+
+
+def _logic_ai_predict(message):
+    uid = message.from_user.id
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    risk = min(99, int(cpu * 0.4 + ram * 0.45 + len(bot_scripts) * 1.5))
+    level = "🟢 Low Risk" if risk < 40 else ("🟡 Moderate Risk" if risk < 70 else "🔴 High Load Risk")
+    bot.reply_to(
+        message,
+        f"🔮 **AI CRASH PREDICTOR & DEPLOY ADVISOR**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **Predicted Instability:** `{risk}%` ({level})\n"
+        f"🖥️ **System:** CPU `{cpu}%` | RAM `{ram}%`\n"
+        f"🚀 **AI Deploy Tip:** টোকেন `BOT_TOKEN` এনভায়রনমেন্টে রাখুন এবং আপলোডের আগে লোকালি একবার রান করে যাচাই করুন।",
+        parse_mode="Markdown",
+    )
+
+
+# --- Feature: Daily Streak with 7-Day VIP Reward ---
+def _logic_daily_streak(message):
+    uid = message.from_user.id
+    now = datetime.now()
+
+    if uid not in admin_ids and uid != OWNER_ID:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
+            drow = c.fetchone()
+            dev_hash = drow[0] if (drow and drow[0]) else ""
+            conn.close()
+
+        if dev_hash:
+            allowed, _, reason_bn = bind_or_check_device(uid, dev_hash, source="daily_streak", enforce_strict=True)
+            if not allowed:
+                bot.reply_to(message, reason_bn, parse_mode="Markdown")
+                return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT streak_count, last_claim_at FROM daily_streaks WHERE user_id = ?", (uid,))
+        row = c.fetchone()
+
+        streak_count = int(row[0] or 0) if row else 0
+        last_claim_dt = None
+        if row and row[1]:
+            try:
+                last_claim_dt = datetime.fromisoformat(row[1])
+            except Exception:
+                last_claim_dt = None
+
+        if last_claim_dt is not None:
+            elapsed = now - last_claim_dt
+            if elapsed < timedelta(hours=24):
+                rem = timedelta(hours=24) - elapsed
+                hrs = rem.seconds // 3600
+                mins = (rem.seconds % 3600) // 60
+                conn.close()
+                bot.reply_to(
+                    message,
+                    f"🔥 **DAILY STREAK STATUS**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 Current Streak: `{streak_count}` দিন\n"
+                    f"⏳ পরবর্তী ক্লেইম করতে পারবেন `{hrs} ঘণ্টা {mins} মিনিট` পর।",
+                    parse_mode="Markdown",
+                )
+                return
+
+            if elapsed <= timedelta(hours=48):
+                new_streak = streak_count + 1
+            else:
+                new_streak = 1
+        else:
+            new_streak = 1
+
+        c.execute(
+            "INSERT OR REPLACE INTO daily_streaks (user_id, streak_count, last_claim_at) VALUES (?, ?, ?)",
+            (uid, new_streak, now.isoformat()),
+        )
+        conn.commit()
+        conn.close()
+
+    bonus_msg = ""
+    if new_streak % STREAK_REWARD_DAYS == 0:
+        new_exp, final_lim = save_subscription(uid, "Streak Reward VIP", STREAK_BONUS_VIP_DAYS, SUBSCRIBED_USER_LIMIT, stack=True)
+        bonus_msg = (
+            f"\n🎉 **STREAK MILESTONE!** `{STREAK_REWARD_DAYS}` দিন পূর্ণ হওয়ায় `+{STREAK_BONUS_VIP_DAYS}` দিন VIP (Limit: `{final_lim}`) যুক্ত হয়েছে!\n"
+            f"⏳ মেয়াদ: `{new_exp.strftime('%Y-%m-%d %H:%M')}`"
+        )
+
+    rem_to_reward = STREAK_REWARD_DAYS - (new_streak % STREAK_REWARD_DAYS)
+    if rem_to_reward == STREAK_REWARD_DAYS:
+        rem_to_reward = STREAK_REWARD_DAYS
+
+    bot.reply_to(
+        message,
+        f"🔥 **DAILY STREAK UPDATED!**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ আজকের স্ট্রিক ক্লেইম সফল হয়েছে!\n"
+        f"📈 Current Streak: `{new_streak}` দিন\n"
+        f"🎁 Next VIP Reward in: `{rem_to_reward}` দিন"
+        f"{bonus_msg}",
+        parse_mode="Markdown",
+    )
+
+
+# --- Feature: Instant User Bot Files ZIP Backup ---
+def _logic_bot_backup(message):
+    uid = message.from_user.id
+    folder = get_user_folder(uid)
+    files_to_zip = []
+    for root, _, files in os.walk(folder):
+        for fname in files:
+            if fname.endswith(".log"):
+                continue
+            full_p = os.path.join(root, fname)
+            rel_p = os.path.relpath(full_p, folder)
+            files_to_zip.append((full_p, rel_p))
+
+    if not files_to_zip:
+        bot.reply_to(message, "📂 ব্যাকআপ করার মতো আপনার কোনো বট ফাইল নেই। আগে **🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗕𝗼𝘁** থেকে ফাইল আপলোড করুন।", parse_mode="Markdown")
+        return
+
+    wait_msg = bot.reply_to(message, "💾 আপনার বট ফাইলগুলোর `.zip` ব্যাকআপ তৈরি হচ্ছে...", parse_mode="Markdown")
+    buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for full_p, rel_p in files_to_zip:
+                zf.write(full_p, arcname=rel_p)
+        buf.seek(0)
+        zip_name = f"hostify_backup_{uid}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+        bot.send_document(
+            message.chat.id,
+            buf,
+            visible_file_name=zip_name,
+            caption=f"💾 **BOT BACKUP READY**\n📄 Total Files: `{len(files_to_zip)}`",
+            parse_mode="Markdown",
+        )
+        try:
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        bot.edit_message_text(f"❌ ব্যাকআপ তৈরি করতে সমস্যা হয়েছে: `{e}`", message.chat.id, wait_msg.message_id, parse_mode="Markdown")
+
+
+# --- Feature: Live Bot Health & Process Inspector ---
+def _logic_bot_health(message):
+    uid = message.from_user.id
+    flist = user_files.get(uid, [])
+    folder = get_user_folder(uid)
+    now = datetime.now()
+
+    if not flist:
+        bot.reply_to(
+            message,
+            f"🩺 **BOT HEALTH MONITOR**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📂 Hosted Files: `0` / `{get_user_file_limit(uid)}`\n"
+            f"⚡ Server CPU: `{psutil.cpu_percent()}%` | RAM: `{psutil.virtual_memory().percent}%`\n"
+            f"💡 নতুন বট চালু করতে **🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗕𝗼𝘁** চাপুন।",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = [f"🩺 **BOT HEALTH MONITOR (`{uid}`)**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    running_cnt = 0
+    for fname, ftype in flist:
+        skey = f"{uid}_{fname}"
+        sinfo = bot_scripts.get(skey, {})
+        running = is_bot_running(uid, fname)
+        if running:
+            running_cnt += 1
+        pid = sinfo["process"].pid if (running and sinfo.get("process")) else "N/A"
+        start_dt = sinfo.get("start_time")
+        uptime_str = "Stopped"
+        if running and isinstance(start_dt, datetime):
+            delta = now - start_dt
+            hrs = delta.seconds // 3600 + delta.days * 24
+            mins = (delta.seconds % 3600) // 60
+            uptime_str = f"{hrs}h {mins}m"
+
+        log_path = os.path.join(folder, f"{os.path.splitext(fname)[0]}.log")
+        log_kb = round(os.path.getsize(log_path) / 1024, 1) if os.path.exists(log_path) else 0.0
+        st_icon = "🟢 Running" if running else "🔴 Stopped"
+        lines.append(
+            f"• `{fname}` (`{ftype.upper()}`) — {st_icon}\n"
+            f"  PID: `{pid}` | Uptime: `{uptime_str}` | Log: `{log_kb} KB`"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 Active: `{running_cnt}/{len(flist)}` | CPU: `{psutil.cpu_percent()}%` | RAM: `{psutil.virtual_memory().percent}%`")
+    bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+
+
+# --- Feature: Support Ticket System with Admin Reply ---
+def _logic_ticket_prompt(message):
+    uid = message.from_user.id
+    pending_ticket_users.add(uid)
+    msg = bot.reply_to(
+        message,
+        "🆘 **SUPPORT TICKET**\n"
+        "আপনার সমস্যা বা অনুরোধ বিস্তারিত লিখে পাঠান।\n"
+        "*(বাতিল করতে `cancel` লিখুন)*",
+        parse_mode="Markdown",
+    )
+    bot.register_next_step_handler(msg, process_support_ticket)
+
+
+def process_support_ticket(message):
+    uid = message.from_user.id
+    pending_ticket_users.discard(uid)
+    text = (message.text or "").strip()
+    if not text:
+        bot.reply_to(message, "⚠️ খালি টিকিট পাঠানো যাবে না।")
+        return
+    if text.lower() == "cancel":
+        bot.reply_to(message, "❌ সাপোর্ট টিকিট বাতিল করা হয়েছে।")
+        return
+
+    uname = f"@{message.from_user.username}" if message.from_user.username else "NoUsername"
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO support_tickets (user_id, username, message_text, status, created_at) VALUES (?, ?, ?, 'OPEN', ?)",
+            (uid, uname, text, datetime.now().isoformat()),
+        )
+        ticket_id = c.lastrowid
+        conn.commit()
+        conn.close()
+
+    bot.reply_to(
+        message,
+        f"✅ **টিকিট #{ticket_id} জমা হয়েছে!**\nআমাদের টিম দ্রুত আপনার সাথে যোগাযোগ করবে।",
+        parse_mode="Markdown",
+    )
+
+    admin_msg = (
+        f"🆘 **NEW SUPPORT TICKET #{ticket_id}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 User: `{uid}` ({uname})\n"
+        f"📝 Message:\n{text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    rm = types.InlineKeyboardMarkup()
+    rm.add(types.InlineKeyboardButton(f"💬 Reply to #{ticket_id}", callback_data=f"reply_tkt_{ticket_id}_{uid}"))
+
+    notified = set()
+    for aid in set(admin_ids) | {OWNER_ID}:
+        if aid in notified:
+            continue
+        notified.add(aid)
+        try:
+            bot.send_message(aid, admin_msg, reply_markup=rm, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+def process_admin_ticket_reply(message):
+    aid = message.from_user.id
+    info = pending_admin_replies.pop(aid, None)
+    if not info:
+        return
+    reply_txt = (message.text or "").strip()
+    if not reply_txt:
+        bot.reply_to(message, "⚠️ খালি রিপ্লাই পাঠানো যাবে না।")
+        return
+
+    target_uid = info["target_uid"]
+    ticket_id = info["ticket_id"]
+    try:
+        bot.send_message(
+            target_uid,
+            f"📩 **SUPPORT REPLY (Ticket #{ticket_id})**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{reply_txt}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+        )
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute("UPDATE support_tickets SET status = 'ANSWERED' WHERE ticket_id = ?", (ticket_id,))
+            conn.commit()
+            conn.close()
+        bot.reply_to(message, f"✅ Ticket #{ticket_id} এর রিপ্লাই ইউজার `{target_uid}` এর কাছে পাঠানো হয়েছে।", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ রিপ্লাই পাঠাতে সমস্যা হয়েছে: {e}")
+
+
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     uid = message.from_user.id
@@ -1535,12 +2207,6 @@ def start_cmd(message):
     blocked, reason = is_blocked_for_user(uid)
     if blocked:
         bot.reply_to(message, reason)
-        return
-    if not check_force_sub(uid):
-        m = types.InlineKeyboardMarkup()
-        m.add(types.InlineKeyboardButton("📢 Join Official Channel", url=f"https://t.me/{UPDATE_CHANNEL}"))
-        m.add(types.InlineKeyboardButton("🔄 Verify Membership", callback_data="check_join"))
-        bot.send_message(message.chat.id, "⚠️ আগে অফিশিয়াল চ্যানেলে জয়েন করুন, তারপর Verify Membership চাপুন।", reply_markup=m)
         return
 
     args = message.text.split()
@@ -1568,11 +2234,21 @@ def start_cmd(message):
             conn.commit()
             conn.close()
 
-    bot.send_message(
+    is_joined = check_force_sub(uid)
+    verify_markup = types.InlineKeyboardMarkup()
+    verify_markup.add(types.InlineKeyboardButton("📢 Join Official Channel", url=get_channel_url()))
+    verify_markup.add(types.InlineKeyboardButton("🔄 Verify Membership", callback_data="check_join"))
+
+    welcome_caption = (
+        f"✨ **WELCOME TO HOSTIFY CLOUD** ✨\n"
+        f"👋 Hello, **{message.from_user.first_name}**!\n"
+        f"⚡ 24/7 Python & Node.js Bot Hosting + Proxy & AI Suite.\n\n"
+        + ("✅ আপনার মেম্বারশিপ ভেরিফাইড!" if is_joined else "⚠️ বটের পূর্ণ সেবা পেতে নিচের চ্যানেলে জয়েন করে **Verify Membership** চাপুন।")
+    )
+    send_welcome_banner(
         message.chat.id,
-        f"✨ **WELCOME TO HOSTIFY CLOUD** ✨\n👋 Hello, **{message.from_user.first_name}**!\n⚡ 24/7 Python & Node.js Bot Hosting.",
-        reply_markup=main_menu_markup(uid),
-        parse_mode="Markdown",
+        welcome_caption,
+        reply_markup=main_menu_markup(uid) if is_joined else verify_markup,
     )
 
 
@@ -1589,7 +2265,14 @@ def check_join_cb(call):
             bot.delete_message(call.message.chat.id, call.message.message_id)
         except Exception:
             pass
-        bot.send_message(call.message.chat.id, "✅ চ্যানেল মেম্বারশিপ ভেরিফাইড হয়েছে!", reply_markup=main_menu_markup(uid))
+        send_welcome_banner(
+            call.message.chat.id,
+            f"✅ **VERIFIED!**\n"
+            f"✨ **WELCOME TO HOSTIFY CLOUD** ✨\n"
+            f"👋 Hello, **{call.from_user.first_name}**!\n"
+            f"⚡ 24/7 Python & Node.js Bot Hosting + Proxy & AI Suite.",
+            reply_markup=main_menu_markup(uid),
+        )
     else:
         bot.answer_callback_query(call.id, "❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
 
@@ -1619,6 +2302,12 @@ def _logic_my_profile(message):
     c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
     drow = c.fetchone()
     dev_status = "Locked 🔒" if (drow and drow[0]) else "Not Bound 🔓"
+    c.execute("SELECT streak_count FROM daily_streaks WHERE user_id = ?", (uid,))
+    srow = c.fetchone()
+    streak_val = int(srow[0] or 0) if srow else 0
+    c.execute("SELECT COUNT(*) FROM user_proxies WHERE user_id = ?", (uid,))
+    prow = c.fetchone()
+    proxy_cnt = int(prow[0] or 0) if prow else 0
     conn.close()
 
     expiry_str = "Lifetime" if uid in admin_ids else "None"
@@ -1631,6 +2320,8 @@ def _logic_my_profile(message):
         f"🆔 Telegram ID: `{uid}`\n"
         f"🔰 Account Tier: `{status}`\n"
         f"🔐 Device Guard: `{dev_status}`\n"
+        f"🔥 Daily Streak: `{streak_val}` দিন\n"
+        f"🌐 Saved Proxies: `{proxy_cnt}`\n"
         f"⏳ Expiry: `{expiry_str}`\n"
         f"📁 Deployed Bots: `{get_user_file_count(uid)}` / `{get_user_file_limit(uid)}`\n"
         f"🎁 Successful Referrals: `{ref_count} users`\n"
@@ -2058,6 +2749,10 @@ def callbacks(call):
     uid = call.from_user.id
     data = call.data
 
+    if data == "check_join":
+        check_join_cb(call)
+        return
+
     if data.startswith("verify_claim_"):
         handle_verify_claim(call)
         return
@@ -2065,6 +2760,20 @@ def callbacks(call):
     blocked, reason = is_blocked_for_user(uid)
     if blocked:
         bot.answer_callback_query(call.id, reason, show_alert=True)
+        return
+
+    if data.startswith("reply_tkt_") and uid in admin_ids:
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        tkt_id = int(parts[2])
+        target_uid = int(parts[3])
+        pending_admin_replies[uid] = {"ticket_id": tkt_id, "target_uid": target_uid}
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"💬 Ticket #{tkt_id} (User `{target_uid}`) এর জন্য রিপ্লাই মেসেজটি লিখুন:",
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(msg, process_admin_ticket_reply)
         return
 
     if data == "view_plans_cb":
@@ -2162,7 +2871,7 @@ def callbacks(call):
         bot.answer_callback_query(call.id)
         msg = bot.send_message(
             call.message.chat.id,
-            "📝 **Format:** `Name | Limit | Price | Duration | Link`\nউদাহরণ: `VIP | 15 | 5 USDT | 30 | https://t.me/hostifyofficials`",
+            "📝 **Format:** `Name | Limit | Price | Duration | Link`\nউদাহরণ: `VIP | 15 | 5 USDT | 30 | https://t.me/hostifyofficialsbot`",
             parse_mode="Markdown",
         )
         bot.register_next_step_handler(msg, handle_add_plan_step)
@@ -2531,23 +3240,39 @@ def process_broadcast(message):
 
 
 BUTTON_MAPPING = {
-    "📢 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹": lambda m: bot.reply_to(m, f"📢 Channel: https://t.me/{UPDATE_CHANNEL}"),
+    "📢 𝗨𝗽𝗱𝗮𝘁𝗲𝘀 𝗖𝗵𝗮𝗻𝗻𝗲𝗹": lambda m: bot.reply_to(m, f"📢 Channel: {get_channel_url()}"),
     "⚡ 𝗦𝗽𝗲𝗲𝗱 & 𝗣𝗶𝗻𝗴": lambda m: bot.reply_to(m, f"⚡ CPU: `{psutil.cpu_percent()}%` | RAM: `{psutil.virtual_memory().percent}%`", parse_mode="Markdown"),
     "🚀 𝗨𝗽𝗹𝗼𝗮𝗱 𝗕𝗼𝘁": _logic_upload_prompt,
     "📁 𝗠𝗮𝗻𝗮𝗴𝗲 𝗕𝗼𝘁𝘀": _logic_check_files,
+    "🩺 𝗕𝗼𝘁 𝗛𝗲𝗮𝗹𝘁𝗵": _logic_bot_health,
+    "💾 𝗕𝗮𝗰𝗸𝘂𝗽": _logic_bot_backup,
+    "🔥 𝗗𝗮𝗶𝗹𝘆 𝗦𝘁𝗿𝗲𝗮𝗸": _logic_daily_streak,
+    "🌐 𝗣𝗿𝗼𝘅𝘆 𝗩𝗮𝘂𝗹𝘁": _logic_proxy_vault,
+    "🧪 𝗣𝗿𝗼𝘅𝘆 𝗧𝗲𝘀𝘁": _logic_proxy_test,
+    "🔄 𝗥𝗼𝘁𝗮𝘁𝗲 𝗣𝗿𝗼𝘅𝘆": _logic_rotate_proxy,
+    "✨ 𝗦𝘁𝘆𝗹𝗶𝘀𝘁 𝗖𝗮𝗿𝗱": _logic_stylist_card,
+    "🛡️ 𝗩𝗜𝗣 𝗦𝗵𝗶𝗲𝗹𝗱": _logic_vip_shield,
+    "🤖 𝗔𝗜 𝗖𝗼𝗱𝗲 𝗔𝘂𝗱𝗶𝘁": _logic_ai_code_audit,
+    "🧠 𝗔𝗜 𝗟𝗼𝗴 𝗗𝗼𝗰": _logic_ai_log_doc,
+    "✨ 𝗔𝗜 𝗦𝘁𝘆𝗹𝗶𝘀𝘁": _logic_ai_stylist,
+    "🔮 𝗔𝗜 𝗣𝗿𝗲𝗱𝗶𝗰𝘁": _logic_ai_predict,
     "💳 𝗩𝗶𝗲𝘄 𝗣𝗹𝗮𝗻𝘀": _logic_view_plans,
     "🎁 𝗘𝗮𝗿𝗻 𝗩𝗜𝗣": _logic_earn_vip,
     "🎟️ 𝗥𝗲𝗱𝗲𝗲𝗺 𝗖𝗼𝗱𝗲": _logic_redeem_prompt,
     "🔗 𝗥𝗲𝗳𝗲𝗿𝗿𝗮𝗹": _logic_referral,
     "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲": _logic_my_profile,
+    "🆘 𝗧𝗶𝗰𝗸𝗲𝘁": _logic_ticket_prompt,
     "💬 𝗦𝘂𝗽𝗽𝗼𝗿𝘁": lambda m: bot.reply_to(m, f"💬 Support: {YOUR_USERNAME}"),
     "👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿": lambda m: bot.reply_to(m, f"👑 Owner: {YOUR_USERNAME}"),
-    "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹": lambda m: bot.reply_to(
-        m,
-        f"🛡️ **ADMIN CONTROL CONSOLE**\n🛠️ Maintenance Mode: `{'ON' if maintenance_mode else 'OFF'}`",
-        reply_markup=admin_panel_markup(),
-        parse_mode="Markdown",
-    ) if m.from_user.id in admin_ids else None,
+    "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹": lambda m: (
+        play_stylist_animation(m, "ADMIN CONSOLE"),
+        bot.reply_to(
+            m,
+            f"🛡️ **ADMIN CONTROL CONSOLE**\n🛠️ Maintenance Mode: `{'ON' if maintenance_mode else 'OFF'}`",
+            reply_markup=admin_panel_markup(),
+            parse_mode="Markdown",
+        ),
+    )[1] if m.from_user.id in admin_ids else None,
     "📊 𝗦𝘆𝘀𝘁𝗲𝗺 𝗦𝘁𝗮𝘁𝘀": lambda m: bot.reply_to(
         m,
         f"📊 Active Users: `{len(active_users)}` | Running Bots: `{len(bot_scripts)}` | Maint: `{'ON' if maintenance_mode else 'OFF'}`",
@@ -2565,7 +3290,7 @@ def main_btns(m):
         return
     if not check_force_sub(uid):
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📢 Join Official Channel", url=f"https://t.me/{UPDATE_CHANNEL}"))
+        markup.add(types.InlineKeyboardButton("📢 Join Official Channel", url=get_channel_url()))
         markup.add(types.InlineKeyboardButton("🔄 Verify Membership", callback_data="check_join"))
         bot.send_message(m.chat.id, "⚠️ আগে চ্যানেলে জয়েন করে Verify Membership চাপুন!", reply_markup=markup)
         return
