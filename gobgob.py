@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -23,6 +22,8 @@ from telebot import types
 
 USDT_BDT_RATE = 120.0
 MONETAG_ZONE_ID = "12284632"
+AD_CLAIM_COOLDOWN_HOURS = 24
+MAX_ACCOUNTS_PER_DEVICE = 1  # একই ডিভাইসে সর্বোচ্চ কতটি Telegram অ্যাকাউন্ট অনুমোদিত
 
 TOKEN = "9240200295:AAFLy16Jecm7WtfdJPrzwqcsHG1JiqqlKD8"
 OWNER_ID = 8452462370
@@ -38,6 +39,7 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, "upload_bots")
 IROTECH_DIR = os.path.join(BASE_DIR, "inf")
 DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data.db")
+DEVICE_PEPPER = hashlib.sha256(f"{TOKEN}:{OWNER_ID}:HOSTIFY_DEVICE_GUARD_V2".encode("utf-8")).hexdigest()
 
 FREE_USER_LIMIT = 0
 SUBSCRIBED_USER_LIMIT = 15
@@ -66,25 +68,265 @@ logger = logging.getLogger(__name__)
 DB_LOCK = threading.Lock()
 
 
+def _extract_client_ip(req):
+    if req is None:
+        return ""
+    xff = req.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = req.headers.get("X-Real-IP", "")
+    if xri:
+        return xri.strip()
+    return (req.remote_addr or "").strip()
+
+
+def build_device_fingerprint(user_id=0, req=None, client_dev_id="", extra_sig=""):
+    """
+    Strong multi-signal device fingerprint using persistent client ID,
+    browser/OS headers, optional client telemetry signature, and server pepper.
+    """
+    clean_client_id = re.sub(r"[^A-Za-z0-9_.-]", "", str(client_dev_id or "").strip())[:80]
+    clean_extra = re.sub(r"[^A-Za-z0-9_.:;,-]", "", str(extra_sig or "").strip())[:160]
+    ua = ""
+    lang = ""
+    ip = ""
+    sec_ch_ua = ""
+    sec_ch_platform = ""
+    if req is not None:
+        ua = req.headers.get("User-Agent", "").strip()
+        lang = req.headers.get("Accept-Language", "").strip()
+        ip = _extract_client_ip(req)
+        sec_ch_ua = req.headers.get("Sec-CH-UA", "").strip()
+        sec_ch_platform = req.headers.get("Sec-CH-UA-Platform", "").strip()
+
+    if clean_client_id:
+        payload = f"cid:{clean_client_id}|ua:{ua}|plat:{sec_ch_platform}|ch:{sec_ch_ua}|ext:{clean_extra}"
+        digest = hmac.new(DEVICE_PEPPER.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"dev_{digest[:28]}"
+
+    if ua or ip or clean_extra:
+        payload = f"soft:{ua}|{lang}|{ip}|{sec_ch_platform}|{clean_extra}"
+        digest = hmac.new(DEVICE_PEPPER.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"sft_{digest[:28]}"
+
+    return f"tg_{user_id}"
+
+
+def log_device_abuse(user_id, existing_owner_id, device_hash, action_type, detail=""):
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO device_abuse_logs
+                   (user_id, existing_owner_id, device_hash, action_type, detail, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (int(user_id), int(existing_owner_id or 0), str(device_hash), str(action_type), str(detail), datetime.now().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Device abuse log error: {e}")
+
+
+def bind_or_check_device(user_id, device_hash, source="web", enforce_strict=True):
+    """
+    Returns (allowed: bool, conflict_owner_id: int or None, reason_bn: str)
+    Enforces that a device_hash isn't shared across multiple Telegram accounts.
+    """
+    if user_id in admin_ids or user_id == OWNER_ID:
+        return True, None, ""
+    if not device_hash or str(device_hash).startswith("tg_"):
+        if enforce_strict:
+            return False, None, "❌ ডিভাইস ভেরিফিকেশন সম্পন্ন হয়নি। অনুগ্রহ করে অ্যাড পেজ সঠিকভাবে সম্পন্ন করুন।"
+        return True, None, ""
+
+    now_str = datetime.now().isoformat()
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+
+        c.execute("SELECT owner_user_id, is_blocked FROM device_locks WHERE device_hash = ?", (device_hash,))
+        lock_row = c.fetchone()
+
+        if lock_row:
+            owner_uid, is_blocked = int(lock_row[0]), int(lock_row[1] or 0)
+            if is_blocked == 1 and owner_uid != int(user_id):
+                conn.close()
+                log_device_abuse(user_id, owner_uid, device_hash, source, "Blocked device lock")
+                return False, owner_uid, "❌ এই ডিভাইসটি সিকিউরিটি লকের আওতায় ব্লক করা হয়েছে!"
+
+            if owner_uid != int(user_id):
+                c.execute("SELECT COUNT(DISTINCT user_id) FROM device_accounts WHERE device_hash = ?", (device_hash,))
+                acc_count = int((c.fetchone() or [1])[0] or 1)
+                c.execute(
+                    "INSERT OR REPLACE INTO device_accounts (device_hash, user_id, source, last_seen) VALUES (?, ?, ?, ?)",
+                    (device_hash, int(user_id), source, now_str),
+                )
+                conn.commit()
+                conn.close()
+                log_device_abuse(user_id, owner_uid, device_hash, source, f"Multi-account attempt (count={acc_count + 1})")
+                return (
+                    False,
+                    owner_uid,
+                    f"❌ **SAME-DEVICE MULTI-ACCOUNT BLOCKED!**\n"
+                    f"এই ডিভাইসটি ইতিমধ্যে অন্য একটি Telegram অ্যাকাউন্ট (`{owner_uid}`) দিয়ে লক করা আছে।\n"
+                    f"একই ডিভাইস থেকে একাধিক Telegram অ্যাকাউন্ট দিয়ে VIP বা Voucher নেওয়া সম্পূর্ণ নিষিদ্ধ।",
+                )
+
+            c.execute("UPDATE device_locks SET last_seen = ? WHERE device_hash = ?", (now_str, device_hash))
+            c.execute(
+                "INSERT OR REPLACE INTO device_accounts (device_hash, user_id, source, last_seen) VALUES (?, ?, ?, ?)",
+                (device_hash, int(user_id), source, now_str),
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO user_devices (user_id, device_hash, updated_at) VALUES (?, ?, ?)",
+                (int(user_id), device_hash, now_str),
+            )
+            conn.commit()
+            conn.close()
+            return True, None, ""
+
+        # Check if this device_hash already appeared on another user_id previously
+        c.execute("SELECT user_id FROM user_devices WHERE device_hash = ? AND user_id != ? LIMIT 1", (device_hash, int(user_id)))
+        other_dev = c.fetchone()
+        if other_dev:
+            other_uid = int(other_dev[0])
+            c.execute(
+                "INSERT OR IGNORE INTO device_locks (device_hash, owner_user_id, is_blocked, created_at, last_seen) VALUES (?, ?, 0, ?, ?)",
+                (device_hash, other_uid, now_str, now_str),
+            )
+            c.execute(
+                "INSERT OR REPLACE INTO device_accounts (device_hash, user_id, source, last_seen) VALUES (?, ?, ?, ?)",
+                (device_hash, int(user_id), source, now_str),
+            )
+            conn.commit()
+            conn.close()
+            log_device_abuse(user_id, other_uid, device_hash, source, "Matched prior user_devices fingerprint")
+            return (
+                False,
+                other_uid,
+                f"❌ **SAME-DEVICE MULTI-ACCOUNT BLOCKED!**\n"
+                f"এই ডিভাইসটি পূর্বে অন্য একটি Telegram অ্যাকাউন্ট (`{other_uid}`) এর সাথে যুক্ত ছিল।",
+            )
+
+        # Lock device to this user
+        c.execute(
+            "INSERT INTO device_locks (device_hash, owner_user_id, is_blocked, created_at, last_seen) VALUES (?, ?, 0, ?, ?)",
+            (device_hash, int(user_id), now_str, now_str),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO device_accounts (device_hash, user_id, source, last_seen) VALUES (?, ?, ?, ?)",
+            (device_hash, int(user_id), source, now_str),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO user_devices (user_id, device_hash, updated_at) VALUES (?, ?, ?)",
+            (int(user_id), device_hash, now_str),
+        )
+        conn.commit()
+        conn.close()
+        return True, None, ""
+
+
 def init_db():
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, plan_name TEXT, expiry TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS user_files (user_id INTEGER, file_name TEXT, file_type TEXT, bot_token TEXT, PRIMARY KEY (user_id, file_name))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            plan_name TEXT,
+            expiry TEXT,
+            file_limit INTEGER DEFAULT 15
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_files (
+            user_id INTEGER,
+            file_name TEXT,
+            file_type TEXT,
+            bot_token TEXT,
+            PRIMARY KEY (user_id, file_name)
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS active_users (user_id INTEGER PRIMARY KEY)""")
         c.execute("""CREATE TABLE IF NOT EXISTS banned_users (user_id INTEGER PRIMARY KEY)""")
         c.execute("""CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS plans (plan_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, file_limit INTEGER, price TEXT, duration INTEGER, buy_link TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS referrals (user_id INTEGER PRIMARY KEY, referred_by INTEGER, ref_count INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS plans (
+            plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            file_limit INTEGER,
+            price TEXT,
+            duration INTEGER,
+            buy_link TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS referrals (
+            user_id INTEGER PRIMARY KEY,
+            referred_by INTEGER,
+            ref_count INTEGER DEFAULT 0
+        )""")
         c.execute("""CREATE TABLE IF NOT EXISTS used_txids (tx_id TEXT PRIMARY KEY)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS vouchers (code TEXT PRIMARY KEY, days INTEGER, file_limit INTEGER, is_used INTEGER DEFAULT 0)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS ad_sessions (token TEXT PRIMARY KEY, user_id INTEGER, verified INTEGER DEFAULT 0, created_at TEXT, claimed INTEGER DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS vouchers (
+            code TEXT PRIMARY KEY,
+            days INTEGER,
+            file_limit INTEGER,
+            max_uses INTEGER DEFAULT 1,
+            used_count INTEGER DEFAULT 0,
+            is_used INTEGER DEFAULT 0,
+            expires_at TEXT DEFAULT ''
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS voucher_redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT,
+            user_id INTEGER,
+            device_hash TEXT,
+            redeemed_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_devices (
+            user_id INTEGER PRIMARY KEY,
+            device_hash TEXT,
+            updated_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS device_locks (
+            device_hash TEXT PRIMARY KEY,
+            owner_user_id INTEGER,
+            is_blocked INTEGER DEFAULT 0,
+            created_at TEXT,
+            last_seen TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS device_accounts (
+            device_hash TEXT,
+            user_id INTEGER,
+            source TEXT,
+            last_seen TEXT,
+            PRIMARY KEY (device_hash, user_id)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS device_abuse_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            existing_owner_id INTEGER,
+            device_hash TEXT,
+            action_type TEXT,
+            detail TEXT,
+            created_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS ad_sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER,
+            device_hash TEXT,
+            verified INTEGER DEFAULT 0,
+            created_at TEXT,
+            claimed INTEGER DEFAULT 0
+        )""")
 
-        try:
-            c.execute("ALTER TABLE user_files ADD COLUMN bot_token TEXT")
-        except Exception:
-            pass
+        for alter_sql in [
+            "ALTER TABLE subscriptions ADD COLUMN file_limit INTEGER DEFAULT 15",
+            "ALTER TABLE user_files ADD COLUMN bot_token TEXT",
+            "ALTER TABLE vouchers ADD COLUMN max_uses INTEGER DEFAULT 1",
+            "ALTER TABLE vouchers ADD COLUMN used_count INTEGER DEFAULT 0",
+            "ALTER TABLE vouchers ADD COLUMN expires_at TEXT DEFAULT ''",
+            "ALTER TABLE ad_sessions ADD COLUMN device_hash TEXT",
+        ]:
+            try:
+                c.execute(alter_sql)
+            except Exception:
+                pass
 
         c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
@@ -97,10 +339,15 @@ def load_data():
     try:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("SELECT user_id, plan_name, expiry FROM subscriptions")
+        c.execute("SELECT user_id, plan_name, expiry, file_limit FROM subscriptions")
         for row in c.fetchall():
             try:
-                user_subscriptions[row[0]] = {"plan_name": row[1], "expiry": datetime.fromisoformat(row[2])}
+                flim = int(row[3]) if row[3] is not None else SUBSCRIBED_USER_LIMIT
+                user_subscriptions[row[0]] = {
+                    "plan_name": row[1],
+                    "expiry": datetime.fromisoformat(row[2]),
+                    "file_limit": flim,
+                }
             except Exception:
                 pass
 
@@ -125,7 +372,7 @@ init_db()
 load_data()
 
 
-# --- Flask Server with Strict Ad Verification ---
+# --- Flask Server with Systemic Motion Graphics Ad Page & Strict Device Guard ---
 app = Flask("")
 
 
@@ -143,7 +390,7 @@ def create_ad_session(uid):
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO ad_sessions (token, user_id, verified, created_at, claimed) VALUES (?, ?, 0, ?, 0)",
+            "INSERT INTO ad_sessions (token, user_id, device_hash, verified, created_at, claimed) VALUES (?, ?, '', 0, ?, 0)",
             (token, uid, datetime.now().isoformat()),
         )
         conn.commit()
@@ -158,11 +405,16 @@ def flask_home():
 
 @app.route("/ad/<token>")
 def ad_page(token):
+    soft_dev_hash = build_device_fingerprint(0, request)
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute("SELECT user_id, verified, claimed FROM ad_sessions WHERE token = ?", (token,))
         row = c.fetchone()
+        if row:
+            uid = row[0]
+            c.execute("UPDATE ad_sessions SET device_hash = ? WHERE token = ?", (soft_dev_hash, token))
+            conn.commit()
         conn.close()
 
     if not row:
@@ -174,67 +426,468 @@ def ad_page(token):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>HOSTIFY ⚡ Ad Verification</title>
+        <title>HOSTIFY ⚡ Systemic Ad & Motion Verification</title>
         <style>
-            body {{ background: #090d16; color: #f8fafc; font-family: Arial, sans-serif; text-align: center; padding: 40px 15px; }}
-            .card {{ background: #111827; padding: 30px; border-radius: 18px; max-width: 440px; margin: auto; border: 1px solid #1f2937; }}
-            h2 {{ color: #38bdf8; }}
-            p {{ color: #cbd5e1; font-size: 14px; line-height: 1.6; }}
-            .btn {{ background: #2563eb; color: #fff; padding: 13px 22px; border: none; border-radius: 10px; font-size: 15px; font-weight: bold; cursor: pointer; margin-top: 15px; }}
-            .status {{ margin-top: 18px; font-weight: bold; color: #22c55e; }}
+            :root {{
+                --bg-dark: #050811;
+                --panel-bg: rgba(13, 20, 38, 0.82);
+                --border-glow: rgba(56, 189, 248, 0.35);
+                --cyan: #38bdf8;
+                --indigo: #818cf8;
+                --emerald: #22c55e;
+                --amber: #f59e0b;
+                --rose: #f43f5e;
+                --text-main: #f8fafc;
+                --text-muted: #94a3b8;
+            }}
+
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+            body {{
+                background: radial-gradient(circle at 20% 20%, #0f172a 0%, var(--bg-dark) 65%);
+                color: var(--text-main);
+                font-family: 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px 14px;
+                overflow-x: hidden;
+                position: relative;
+            }}
+
+            /* Systemic Animated Background Grid & Orbs */
+            .sys-grid {{
+                position: fixed;
+                inset: 0;
+                background-image:
+                    linear-gradient(rgba(56, 189, 248, 0.06) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(129, 140, 248, 0.06) 1px, transparent 1px);
+                background-size: 38px 38px;
+                animation: gridDrift 18s linear infinite;
+                z-index: 0;
+                pointer-events: none;
+            }}
+
+            @keyframes gridDrift {{
+                0% {{ transform: translate(0, 0); }}
+                100% {{ transform: translate(38px, 38px); }}
+            }}
+
+            .orb {{
+                position: fixed;
+                border-radius: 50%;
+                filter: blur(70px);
+                opacity: 0.35;
+                z-index: 0;
+                pointer-events: none;
+                animation: orbFloat 9s ease-in-out infinite alternate;
+            }}
+            .orb-1 {{ width: 260px; height: 260px; background: #0284c7; top: -60px; left: -50px; }}
+            .orb-2 {{ width: 300px; height: 300px; background: #4f46e5; bottom: -80px; right: -60px; animation-delay: 2s; }}
+            .orb-3 {{ width: 180px; height: 180px; background: #10b981; top: 55%; left: 65%; animation-delay: 4s; }}
+
+            @keyframes orbFloat {{
+                0% {{ transform: translate(0, 0) scale(1); }}
+                100% {{ transform: translate(22px, -28px) scale(1.12); }}
+            }}
+
+            /* Motion Card Container */
+            .card {{
+                position: relative;
+                z-index: 2;
+                background: var(--panel-bg);
+                backdrop-filter: blur(18px);
+                -webkit-backdrop-filter: blur(18px);
+                padding: 28px 22px;
+                border-radius: 24px;
+                max-width: 460px;
+                width: 100%;
+                border: 1px solid var(--border-glow);
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.65), 0 0 30px rgba(56, 189, 248, 0.12);
+                text-align: center;
+                animation: cardEntrance 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+                overflow: hidden;
+            }}
+
+            .card::before {{
+                content: "";
+                position: absolute;
+                top: 0; left: -100%;
+                width: 100%; height: 2px;
+                background: linear-gradient(90deg, transparent, var(--cyan), var(--indigo), transparent);
+                animation: scanLine 3.2s linear infinite;
+            }}
+
+            @keyframes cardEntrance {{
+                0% {{ opacity: 0; transform: translateY(28px) scale(0.96); }}
+                100% {{ opacity: 1; transform: translateY(0) scale(1); }}
+            }}
+
+            @keyframes scanLine {{
+                0% {{ left: -100%; }}
+                100% {{ left: 100%; }}
+            }}
+
+            /* SVG Motion Core */
+            .motion-stage {{
+                position: relative;
+                width: 112px;
+                height: 112px;
+                margin: 0 auto 14px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+
+            .pulse-ring {{
+                position: absolute;
+                inset: 6px;
+                border-radius: 50%;
+                border: 2px solid rgba(56, 189, 248, 0.45);
+                animation: radarPulse 2.4s cubic-bezier(0.24, 0, 0.38, 1) infinite;
+            }}
+            .pulse-ring:nth-child(2) {{
+                animation-delay: 1.2s;
+                border-color: rgba(129, 140, 248, 0.4);
+            }}
+
+            @keyframes radarPulse {{
+                0% {{ transform: scale(0.82); opacity: 0.9; }}
+                100% {{ transform: scale(1.38); opacity: 0; }}
+            }}
+
+            svg.motion-svg {{
+                width: 96px;
+                height: 96px;
+                position: relative;
+                z-index: 2;
+            }}
+
+            .spin-slow {{
+                transform-origin: 48px 48px;
+                animation: spin360 12s linear infinite;
+            }}
+            .spin-reverse {{
+                transform-origin: 48px 48px;
+                animation: spinReverse 7s linear infinite;
+            }}
+            .core-beat {{
+                transform-origin: 48px 48px;
+                animation: coreBeat 1.8s ease-in-out infinite;
+            }}
+
+            @keyframes spin360 {{ to {{ transform: rotate(360deg); }} }}
+            @keyframes spinReverse {{ to {{ transform: rotate(-360deg); }} }}
+            @keyframes coreBeat {{
+                0%, 100% {{ transform: scale(0.94); }}
+                50% {{ transform: scale(1.08); }}
+            }}
+
+            /* Systemic Telemetry Pills */
+            .telemetry-bar {{
+                display: flex;
+                justify-content: center;
+                gap: 8px;
+                flex-wrap: wrap;
+                margin: 10px 0 14px;
+            }}
+
+            .pill {{
+                font-size: 11px;
+                padding: 4px 10px;
+                border-radius: 999px;
+                background: rgba(30, 41, 59, 0.85);
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                color: #bae6fd;
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+            }}
+
+            .dot-live {{
+                width: 7px; height: 7px;
+                border-radius: 50%;
+                background: var(--emerald);
+                box-shadow: 0 0 8px var(--emerald);
+                animation: blinkDot 1.3s infinite;
+            }}
+
+            @keyframes blinkDot {{
+                0%, 100% {{ opacity: 1; transform: scale(1); }}
+                50% {{ opacity: 0.35; transform: scale(0.75); }}
+            }}
+
+            h2 {{
+                font-size: 20px;
+                letter-spacing: 0.4px;
+                background: linear-gradient(90deg, #38bdf8, #a5b4fc, #34d399);
+                background-size: 200% auto;
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                animation: textShimmer 4s linear infinite;
+                margin-bottom: 8px;
+            }}
+
+            @keyframes textShimmer {{
+                0% {{ background-position: 0% center; }}
+                100% {{ background-position: 200% center; }}
+            }}
+
+            p.desc {{
+                color: var(--text-muted);
+                font-size: 13.5px;
+                line-height: 1.65;
+                margin-bottom: 14px;
+            }}
+
+            /* Animated Progress Track */
+            .progress-box {{
+                width: 100%;
+                height: 8px;
+                background: rgba(15, 23, 42, 0.9);
+                border-radius: 999px;
+                overflow: hidden;
+                border: 1px solid rgba(56, 189, 248, 0.2);
+                margin: 12px 0 18px;
+            }}
+
+            .progress-fill {{
+                height: 100%;
+                width: 0%;
+                background: linear-gradient(90deg, #0284c7, #38bdf8, #22c55e);
+                border-radius: 999px;
+                transition: width 0.35s ease;
+                box-shadow: 0 0 14px rgba(56, 189, 248, 0.6);
+            }}
+
+            /* Motion Button */
+            .btn {{
+                position: relative;
+                width: 100%;
+                background: linear-gradient(135deg, #2563eb, #0ea5e9);
+                color: #fff;
+                padding: 14px 22px;
+                border: none;
+                border-radius: 14px;
+                font-size: 15px;
+                font-weight: 700;
+                cursor: pointer;
+                overflow: hidden;
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
+                box-shadow: 0 10px 25px rgba(14, 165, 233, 0.35);
+            }}
+
+            .btn:hover:not(:disabled) {{
+                transform: translateY(-2px) scale(1.01);
+                box-shadow: 0 14px 30px rgba(56, 189, 248, 0.5);
+            }}
+
+            .btn:active:not(:disabled) {{
+                transform: scale(0.98);
+            }}
+
+            .btn::after {{
+                content: "";
+                position: absolute;
+                top: 0; left: -120%;
+                width: 60%; height: 100%;
+                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+                transform: skewX(-20deg);
+                animation: btnSheen 3.5s infinite;
+            }}
+
+            @keyframes btnSheen {{
+                0% {{ left: -120%; }}
+                45%, 100% {{ left: 150%; }}
+            }}
+
+            .btn:disabled {{
+                opacity: 0.75;
+                cursor: not-allowed;
+            }}
+
+            .status {{
+                margin-top: 16px;
+                font-size: 13.5px;
+                font-weight: 600;
+                min-height: 22px;
+                color: var(--emerald);
+                animation: fadeUp 0.4s ease;
+            }}
+
+            .status.err {{
+                color: var(--rose);
+            }}
+
+            @keyframes fadeUp {{
+                from {{ opacity: 0; transform: translateY(6px); }}
+                to {{ opacity: 1; transform: translateY(0); }}
+            }}
+
+            .shield-note {{
+                margin-top: 14px;
+                font-size: 11.5px;
+                color: #64748b;
+            }}
         </style>
         <script src='//libtl.com/sdk.js' data-zone='{MONETAG_ZONE_ID}' data-sdk='show_{MONETAG_ZONE_ID}'></script>
     </head>
     <body>
+        <div class="sys-grid"></div>
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+
         <div class="card">
-            <h2>🚀 HOSTIFY AD VERIFICATION</h2>
-            <p>VIP ক্লেইম করতে নিচের বাটনে ক্লিক করে অ্যাডটি সম্পন্ন করুন। ভেরিফাই হলে বোটে ফিরে গিয়ে <b>Verify & Claim VIP</b> চাপুন।</p>
+            <div class="motion-stage">
+                <div class="pulse-ring"></div>
+                <div class="pulse-ring"></div>
+                <svg class="motion-svg" viewBox="0 0 96 96" fill="none">
+                    <circle class="spin-slow" cx="48" cy="48" r="42" stroke="#38bdf8" stroke-width="2" stroke-dasharray="10 8" opacity="0.75"/>
+                    <circle class="spin-reverse" cx="48" cy="48" r="32" stroke="#818cf8" stroke-width="2" stroke-dasharray="16 10" opacity="0.85"/>
+                    <g class="core-beat">
+                        <polygon points="48,22 70,35 70,61 48,74 26,61 26,35" fill="rgba(14, 165, 233, 0.16)" stroke="#38bdf8" stroke-width="2"/>
+                        <path d="M40 48L46 54L57 42" stroke="#22c55e" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </g>
+                </svg>
+            </div>
+
+            <div class="telemetry-bar">
+                <span class="pill"><span class="dot-live"></span> SYSTEMIC GUARD ACTIVE</span>
+                <span class="pill" id="devBadge">🔒 DEVICE LOCKED</span>
+            </div>
+
+            <h2>🚀 HOSTIFY SYSTEMIC AD ENGINE</h2>
+            <p class="desc">
+                ফ্রি VIP ক্লেইম করতে নিচের <b>Watch Ad Now</b> বাটনে ক্লিক করে অ্যাডটি সম্পন্ন করুন।
+                ভেরিফাই হলে বোটে ফিরে গিয়ে <b>Verify Ad &amp; Claim VIP</b> চাপুন।
+            </p>
+
+            <div class="progress-box">
+                <div class="progress-fill" id="progressBar"></div>
+            </div>
+
             <button id="adBtn" class="btn" onclick="startAd()">👀 Watch Ad Now</button>
             <div id="statusMsg" class="status"></div>
+            <div class="shield-note">🛡️ Multi-Account &amp; Fingerprint Protection Enabled</div>
         </div>
+
         <script>
             let secondsLeft = 6;
+            let verifyingSent = false;
+
+            function setProgress(pct) {{
+                const bar = document.getElementById('progressBar');
+                if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+            }}
+
+            function getPersistentDeviceId() {{
+                const key = 'hostify_client_dev_id';
+                let id = '';
+                try {{ id = localStorage.getItem(key) || ''; }} catch (e) {{}}
+                if (!id) {{
+                    try {{ id = sessionStorage.getItem(key) || ''; }} catch (e) {{}}
+                }}
+                if (!id) {{
+                    const m = document.cookie.match(/(?:^|; )hostify_client_dev_id=([^;]+)/);
+                    if (m) id = decodeURIComponent(m[1]);
+                }}
+                if (!id) {{
+                    const rnd = (window.crypto && crypto.randomUUID)
+                        ? crypto.randomUUID().replace(/-/g, '')
+                        : (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+                    id = 'dev_' + rnd + '_' + Date.now().toString(36);
+                }}
+                try {{ localStorage.setItem(key, id); }} catch (e) {{}}
+                try {{ sessionStorage.setItem(key, id); }} catch (e) {{}}
+                document.cookie = key + '=' + encodeURIComponent(id) + '; max-age=31536000; path=/; SameSite=Lax';
+                return id;
+            }}
+
+            function getExtraSignals() {{
+                const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+                const scr = (window.screen && screen.width && screen.height)
+                    ? `${{screen.width}}x${{screen.height}}x${{screen.colorDepth || 24}}`
+                    : '';
+                const hw = navigator.hardwareConcurrency || 0;
+                const mem = navigator.deviceMemory || 0;
+                const plat = navigator.platform || '';
+                return `${{tz}}|${{scr}}|c${{hw}}|m${{mem}}|p:${{plat}}`;
+            }}
+
+            const clientDevId = getPersistentDeviceId();
+            const extraSig = getExtraSignals();
+            document.getElementById('devBadge').innerText = '🔒 ID: ' + clientDevId.slice(0, 12) + '…';
+
             function confirmVerified() {{
+                if (verifyingSent) return;
+                verifyingSent = true;
+                setProgress(90);
+                const statusEl = document.getElementById('statusMsg');
+                statusEl.classList.remove('err');
+                statusEl.innerText = '⚙️ সিস্টেম ভেরিফিকেশন চলছে...';
+
                 fetch('/api/verify-ad', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ token: '{token}' }})
+                    body: JSON.stringify({{
+                        token: '{token}',
+                        client_dev_id: clientDevId,
+                        extra_sig: extraSig
+                    }})
                 }})
                 .then(r => r.json())
                 .then(data => {{
                     if (data.ok) {{
-                        document.getElementById('statusMsg').innerText = '✅ অ্যাড ভেরিফাই হয়েছে! এখন বোটে গিয়ে Claim করুন।';
+                        setProgress(100);
+                        statusEl.classList.remove('err');
+                        statusEl.innerText = '✅ অ্যাড ভেরিফাই হয়েছে! এখন বোটে গিয়ে Claim করুন।';
                     }} else {{
-                        document.getElementById('statusMsg').innerText = '⚠️ ভেরিফাই করা যায়নি।';
+                        verifyingSent = false;
+                        setProgress(0);
+                        statusEl.classList.add('err');
+                        statusEl.innerText = data.message || '⚠️ ভেরিফাই করা যায়নি (Multi-Account ব্লক হতে পারে)।';
                     }}
+                }})
+                .catch(() => {{
+                    verifyingSent = false;
+                    setProgress(0);
+                    statusEl.classList.add('err');
+                    statusEl.innerText = '⚠️ নেটওয়ার্ক সমস্যা হয়েছে, আবার চেষ্টা করুন।';
                 }});
             }}
 
             function startAd() {{
                 const btn = document.getElementById('adBtn');
                 btn.disabled = true;
-                if (typeof show_{MONETAG_ZONE_ID} === 'function') {{
-                    show_{MONETAG_ZONE_ID}({{ ytag: true }}).then(() => {{
-                        confirmVerified();
-                    }}).catch(() => {{
-                        const timer = setInterval(() => {{
-                            secondsLeft--;
-                            btn.innerText = '⏳ Verifying (' + secondsLeft + 's)...';
-                            if (secondsLeft <= 0) {{
-                                clearInterval(timer);
-                                confirmVerified();
-                            }}
-                        }}, 1000);
-                    }});
-                }} else {{
+                setProgress(20);
+                btn.innerText = '🎬 Loading Ad Stream...';
+
+                const runFallbackTimer = () => {{
                     const timer = setInterval(() => {{
                         secondsLeft--;
-                        btn.innerText = '⏳ Verifying (' + secondsLeft + 's)...';
+                        const elapsed = 6 - secondsLeft;
+                        setProgress(20 + Math.round((elapsed / 6) * 65));
+                        btn.innerText = '⏳ Verifying (' + Math.max(0, secondsLeft) + 's)...';
                         if (secondsLeft <= 0) {{
                             clearInterval(timer);
+                            btn.innerText = '✅ Ad Completed';
                             confirmVerified();
                         }}
                     }}, 1000);
+                }};
+
+                if (typeof show_{MONETAG_ZONE_ID} === 'function') {{
+                    show_{MONETAG_ZONE_ID}({{ ytag: true }}).then(() => {{
+                        setProgress(85);
+                        btn.innerText = '✅ Ad Completed';
+                        confirmVerified();
+                    }}).catch(() => {{
+                        runFallbackTimer();
+                    }});
+                }} else {{
+                    runFallbackTimer();
                 }}
             }}
         </script>
@@ -248,15 +901,39 @@ def ad_page(token):
 def api_verify_ad():
     data = request.get_json(silent=True) or {}
     token = data.get("token", "").strip()
+    client_dev_id = data.get("client_dev_id", "").strip()
+    extra_sig = data.get("extra_sig", "").strip()
     if not token:
-        return {"ok": False}, 400
+        return {"ok": False, "message": "Invalid token"}, 400
+
+    dev_hash = build_device_fingerprint(0, request, client_dev_id, extra_sig)
+
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("UPDATE ad_sessions SET verified = 1 WHERE token = ?", (token,))
+        c.execute("SELECT user_id, claimed FROM ad_sessions WHERE token = ?", (token,))
+        sess = c.fetchone()
+        if not sess:
+            conn.close()
+            return {"ok": False, "message": "Session expired"}, 404
+        uid, claimed = int(sess[0]), int(sess[1] or 0)
+        conn.close()
+
+    if claimed == 1:
+        return {"ok": False, "message": "এই সেশন ইতিমধ্যে ক্লেইম করা হয়েছে।"}, 400
+
+    allowed, _, reason_bn = bind_or_check_device(uid, dev_hash, source="ad_verify", enforce_strict=True)
+    if not allowed:
+        return {"ok": False, "message": reason_bn}, 403
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("UPDATE ad_sessions SET verified = 1, device_hash = ? WHERE token = ?", (dev_hash, token))
         updated = c.rowcount
         conn.commit()
         conn.close()
+
     return {"ok": updated > 0}
 
 
@@ -351,18 +1028,35 @@ def delete_plan_db(plan_id):
     return deleted > 0
 
 
-def save_subscription(user_id, plan_name, expiry):
+def save_subscription(user_id, plan_name, expiry_or_days, file_limit=SUBSCRIBED_USER_LIMIT, stack=True):
+    now = datetime.now()
+    existing = user_subscriptions.get(user_id)
+    if isinstance(expiry_or_days, int):
+        base_time = existing["expiry"] if (stack and existing and existing["expiry"] > now) else now
+        new_expiry = base_time + timedelta(days=expiry_or_days)
+    else:
+        new_expiry = expiry_or_days
+
+    final_limit = int(file_limit) if file_limit is not None else SUBSCRIBED_USER_LIMIT
+    if stack and existing and existing["expiry"] > now:
+        final_limit = max(int(existing.get("file_limit", SUBSCRIBED_USER_LIMIT)), final_limit)
+
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO subscriptions (user_id, plan_name, expiry) VALUES (?, ?, ?)",
-            (user_id, plan_name, expiry.isoformat()),
+            "INSERT OR REPLACE INTO subscriptions (user_id, plan_name, expiry, file_limit) VALUES (?, ?, ?, ?)",
+            (user_id, plan_name, new_expiry.isoformat(), final_limit),
         )
         conn.commit()
         conn.close()
-    user_subscriptions[user_id] = {"plan_name": plan_name, "expiry": expiry}
+    user_subscriptions[user_id] = {
+        "plan_name": plan_name,
+        "expiry": new_expiry,
+        "file_limit": final_limit,
+    }
     notified_expiries.discard(user_id)
+    return new_expiry, final_limit
 
 
 def remove_subscription_db(user_id):
@@ -375,6 +1069,37 @@ def remove_subscription_db(user_id):
     user_subscriptions.pop(user_id, None)
 
 
+def reset_user_device_db(user_id):
+    uid = int(user_id)
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
+        r1 = c.fetchone()
+        c.execute("SELECT device_hash FROM device_locks WHERE owner_user_id = ?", (uid,))
+        r2 = c.fetchall()
+
+        hashes = set()
+        if r1 and r1[0]:
+            hashes.add(r1[0])
+        for item in r2:
+            if item[0]:
+                hashes.add(item[0])
+
+        c.execute("DELETE FROM user_devices WHERE user_id = ?", (uid,))
+        c.execute("DELETE FROM device_locks WHERE owner_user_id = ?", (uid,))
+        c.execute("DELETE FROM device_accounts WHERE user_id = ?", (uid,))
+        for h in hashes:
+            c.execute("DELETE FROM device_locks WHERE device_hash = ?", (h,))
+            c.execute("DELETE FROM device_accounts WHERE device_hash = ?", (h,))
+            c.execute("UPDATE user_devices SET device_hash = '' WHERE device_hash = ?", (h,))
+
+        affected = c.rowcount
+        conn.commit()
+        conn.close()
+    return bool(hashes) or affected > 0
+
+
 def add_admin_db(new_admin_id):
     admin_ids.add(int(new_admin_id))
     with DB_LOCK:
@@ -385,16 +1110,93 @@ def add_admin_db(new_admin_id):
         conn.close()
 
 
-def create_voucher_db(code, days, file_limit=15):
+def create_voucher_db(code, days, file_limit=15, max_uses=1, valid_hours=0):
+    clean_code = code.strip().upper()
+    max_u = max(1, int(max_uses))
+    vh = int(valid_hours or 0)
+    expires_at = (datetime.now() + timedelta(hours=vh)).isoformat() if vh > 0 else ""
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute(
-            "INSERT OR REPLACE INTO vouchers (code, days, file_limit, is_used) VALUES (?, ?, ?, 0)",
-            (code.strip().upper(), int(days), int(file_limit)),
+            """INSERT OR REPLACE INTO vouchers (code, days, file_limit, max_uses, used_count, is_used, expires_at)
+               VALUES (?, ?, ?, ?, 0, 0, ?)""",
+            (clean_code, int(days), int(file_limit), max_u, expires_at),
         )
         conn.commit()
         conn.close()
+
+
+def get_all_vouchers():
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("SELECT code, days, file_limit, max_uses, used_count, is_used, expires_at FROM vouchers ORDER BY code ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_voucher_db(code):
+    clean_code = code.strip().upper()
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("DELETE FROM vouchers WHERE code = ?", (clean_code,))
+        deleted = c.rowcount
+        c.execute("DELETE FROM voucher_redemptions WHERE code = ?", (clean_code,))
+        conn.commit()
+        conn.close()
+    return deleted > 0
+
+
+def clean_inactive_vouchers_db():
+    now = datetime.now()
+    rows = get_all_vouchers()
+    removed = 0
+    for code, days, flim, max_u, used_c, is_used, exp_at in rows:
+        max_u = max(1, int(max_u or 1))
+        used_c = int(used_c or 0)
+        is_exp = False
+        if exp_at:
+            try:
+                is_exp = datetime.fromisoformat(exp_at) <= now
+            except Exception:
+                pass
+        if is_used == 1 or used_c >= max_u or is_exp:
+            if delete_voucher_db(code):
+                removed += 1
+    return removed
+
+
+def build_vouchers_view_payload():
+    rows = get_all_vouchers()
+    if not rows:
+        return "🎟️ এখনো কোনো ভাউচার কোড তৈরি করা হয়নি।", None
+    now = datetime.now()
+    lines = [f"🎟️ **CREATED VOUCHERS (Total: {len(rows)})**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("🧹 Clean Used / Expired Vouchers", callback_data="clean_vouchers"))
+    for code, days, flim, max_u, used_c, is_used, exp_at in rows:
+        max_u = max(1, int(max_u or 1))
+        used_c = int(used_c or 0)
+        exp_label = "No Exp"
+        is_exp = False
+        if exp_at:
+            try:
+                dt = datetime.fromisoformat(exp_at)
+                is_exp = dt <= now
+                exp_label = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                pass
+        if is_exp:
+            st = "⏰ Expired"
+        elif is_used == 1 or used_c >= max_u:
+            st = "🔴 Used/Full"
+        else:
+            st = "🟢 Active"
+        lines.append(f"• `{code}` — `{days}d` | Limit: `{flim}` | Used: `{used_c}/{max_u}` | Exp: `{exp_label}` | {st}")
+        m.add(types.InlineKeyboardButton(f"🗑️ Delete: {code}", callback_data=f"del_vouch_{code}"))
+    return "\n".join(lines), m
 
 
 def is_txid_used(tx_id):
@@ -462,8 +1264,9 @@ def get_user_file_limit(user_id):
         return OWNER_LIMIT
     if user_id in admin_ids:
         return ADMIN_LIMIT
-    if user_id in user_subscriptions and user_subscriptions[user_id]["expiry"] > datetime.now():
-        return SUBSCRIBED_USER_LIMIT
+    sub = user_subscriptions.get(user_id)
+    if sub and sub["expiry"] > datetime.now():
+        return int(sub.get("file_limit", SUBSCRIBED_USER_LIMIT))
     return FREE_USER_LIMIT
 
 
@@ -696,21 +1499,31 @@ def admin_panel_markup():
     )
     m.add(
         types.InlineKeyboardButton("🎟️ Create Voucher", callback_data="create_voucher"),
+        types.InlineKeyboardButton("🎲 Gen Vouchers", callback_data="gen_bulk_vouchers"),
+    )
+    m.add(
+        types.InlineKeyboardButton("📋 View Vouchers", callback_data="view_vouchers"),
+        types.InlineKeyboardButton("🔓 Reset Device", callback_data="reset_device"),
+    )
+    m.add(
+        types.InlineKeyboardButton("🚨 Abuse Logs", callback_data="view_abuse_logs"),
+        types.InlineKeyboardButton("🚫 Ban", callback_data="ban_user"),
+    )
+    m.add(
+        types.InlineKeyboardButton("✅ Unban", callback_data="unban_user"),
+        types.InlineKeyboardButton("📣 Broadcast", callback_data="broadcast"),
+    )
+    m.add(
+        types.InlineKeyboardButton("⚙️ Run All", callback_data="run_all_scripts"),
+        types.InlineKeyboardButton("🛑 Stop All", callback_data="stop_all_scripts"),
+    )
+    m.add(
+        types.InlineKeyboardButton("➕ Add Admin", callback_data="add_admin"),
         types.InlineKeyboardButton(maint_label, callback_data="toggle_maint"),
     )
     m.add(
-        types.InlineKeyboardButton("🚫 Ban", callback_data="ban_user"),
-        types.InlineKeyboardButton("✅ Unban", callback_data="unban_user"),
+        types.InlineKeyboardButton("📊 System Stats", callback_data="stats"),
     )
-    m.add(
-        types.InlineKeyboardButton("📣 Broadcast", callback_data="broadcast"),
-        types.InlineKeyboardButton("⚙️ Run All", callback_data="run_all_scripts"),
-    )
-    m.add(
-        types.InlineKeyboardButton("🛑 Stop All", callback_data="stop_all_scripts"),
-        types.InlineKeyboardButton("➕ Add Admin", callback_data="add_admin"),
-    )
-    m.add(types.InlineKeyboardButton("📊 System Stats", callback_data="stats"))
     return m
 
 
@@ -783,6 +1596,8 @@ def check_join_cb(call):
 
 def _logic_my_profile(message):
     uid = message.from_user.id
+    sub = user_subscriptions.get(uid)
+    is_vip_active = bool(sub and sub["expiry"] > datetime.now())
     status = (
         "👑 System Owner"
         if uid == OWNER_ID
@@ -790,8 +1605,8 @@ def _logic_my_profile(message):
             "🛡️ Administrator"
             if uid in admin_ids
             else (
-                "💎 VIP Enterprise Active"
-                if uid in user_subscriptions and user_subscriptions[uid]["expiry"] > datetime.now()
+                f"💎 {sub['plan_name']}"
+                if is_vip_active
                 else "🆓 Standard Free Tier"
             )
         )
@@ -801,17 +1616,21 @@ def _logic_my_profile(message):
     c.execute("SELECT ref_count FROM referrals WHERE user_id = ?", (uid,))
     row = c.fetchone()
     ref_count = row[0] if row else 0
+    c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
+    drow = c.fetchone()
+    dev_status = "Locked 🔒" if (drow and drow[0]) else "Not Bound 🔓"
     conn.close()
 
     expiry_str = "Lifetime" if uid in admin_ids else "None"
-    if uid not in admin_ids and uid in user_subscriptions and user_subscriptions[uid]["expiry"] > datetime.now():
-        expiry_str = user_subscriptions[uid]["expiry"].strftime("%Y-%m-%d %H:%M")
+    if uid not in admin_ids and is_vip_active:
+        expiry_str = sub["expiry"].strftime("%Y-%m-%d %H:%M")
 
     text = (
         f"👤 **USER ACCOUNT PROFILE**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 Telegram ID: `{uid}`\n"
         f"🔰 Account Tier: `{status}`\n"
+        f"🔐 Device Guard: `{dev_status}`\n"
         f"⏳ Expiry: `{expiry_str}`\n"
         f"📁 Deployed Bots: `{get_user_file_count(uid)}` / `{get_user_file_limit(uid)}`\n"
         f"🎁 Successful Referrals: `{ref_count} users`\n"
@@ -844,34 +1663,156 @@ def _logic_redeem_prompt(message):
 def process_redeem_voucher(message):
     code = message.text.strip().upper()
     uid = message.from_user.id
+
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("SELECT days, file_limit, is_used FROM vouchers WHERE code = ?", (code,))
+        c.execute("SELECT days, file_limit, max_uses, used_count, is_used, expires_at FROM vouchers WHERE code = ?", (code,))
         row = c.fetchone()
         if not row:
             conn.close()
             bot.reply_to(message, "❌ ভুল অথবা অকার্যকর ভাউচার কোড!")
             return
-        days, limit, is_used = row
-        if is_used == 1:
+
+        days, limit, max_uses, used_count, is_used, expires_at = row
+        max_uses = max(1, int(max_uses or 1))
+        used_count = int(used_count or 0)
+
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) <= datetime.now():
+                    conn.close()
+                    bot.reply_to(message, "⏰ এই ভাউচার কোডটির মেয়াদ শেষ হয়ে গেছে!")
+                    return
+            except Exception:
+                pass
+
+        if is_used == 1 or used_count >= max_uses:
             conn.close()
-            bot.reply_to(message, "❌ এই ভাউচার কোডটি ইতিমধ্যে ব্যবহার করা হয়েছে!")
+            bot.reply_to(message, "❌ এই ভাউচার কোডটির ব্যবহারের লিমিট শেষ হয়ে গেছে!")
             return
-        c.execute("UPDATE vouchers SET is_used = 1 WHERE code = ?", (code,))
+
+        c.execute("SELECT id FROM voucher_redemptions WHERE code = ? AND user_id = ?", (code, uid))
+        if c.fetchone():
+            conn.close()
+            bot.reply_to(message, "❌ আপনি এই অ্যাকাউন্ট থেকে ইতিমধ্যে এই ভাউচার কোডটি ব্যবহার করেছেন!")
+            return
+
+        c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
+        dev_row = c.fetchone()
+        dev_hash = dev_row[0] if (dev_row and dev_row[0]) else ""
+        conn.close()
+
+    if uid not in admin_ids and uid != OWNER_ID:
+        if not dev_hash:
+            bot.reply_to(
+                message,
+                "❌ আপনার ডিভাইস এখনো সিস্টেমের সাথে ভেরিফাইড নয়!\n"
+                "ভাউচার রিডিম করার আগে **🎁 Earn VIP** থেকে অ্যাড পেজ ভেরিফাই করে ডিভাইস লক সম্পন্ন করুন।",
+                parse_mode="Markdown",
+            )
+            return
+
+        allowed, _, reason_bn = bind_or_check_device(uid, dev_hash, source="voucher_redeem", enforce_strict=True)
+        if not allowed:
+            bot.reply_to(message, reason_bn, parse_mode="Markdown")
+            return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT days, file_limit, max_uses, used_count, is_used FROM vouchers WHERE code = ?", (code,))
+        fresh = c.fetchone()
+        if not fresh:
+            conn.close()
+            bot.reply_to(message, "❌ ভাউচার কোডটি পাওয়া যায়নি!")
+            return
+        _, _, f_max, f_used, f_is_used = fresh
+        f_max = max(1, int(f_max or 1))
+        f_used = int(f_used or 0)
+        if f_is_used == 1 or f_used >= f_max:
+            conn.close()
+            bot.reply_to(message, "❌ এই ভাউচার কোডটির ব্যবহারের লিমিট শেষ হয়ে গেছে!")
+            return
+
+        if dev_hash:
+            c.execute("SELECT id FROM voucher_redemptions WHERE code = ? AND device_hash = ?", (code, dev_hash))
+            if c.fetchone():
+                conn.close()
+                log_device_abuse(uid, 0, dev_hash, "voucher_redeem", f"Duplicate device redemption for {code}")
+                bot.reply_to(message, "❌ এই ডিভাইস থেকে ইতিমধ্যে এই ভাউচার কোডটি ব্যবহার করা হয়েছে!")
+                return
+
+        new_used = f_used + 1
+        new_is_used = 1 if new_used >= f_max else 0
+
+        c.execute(
+            "UPDATE vouchers SET used_count = ?, is_used = ? WHERE code = ?",
+            (new_used, new_is_used, code),
+        )
+        c.execute(
+            "INSERT INTO voucher_redemptions (code, user_id, device_hash, redeemed_at) VALUES (?, ?, ?, ?)",
+            (code, uid, dev_hash, datetime.now().isoformat()),
+        )
         conn.commit()
         conn.close()
-    expiry = datetime.now() + timedelta(days=days)
-    save_subscription(uid, f"Voucher VIP ({days}d)", expiry)
+
+    new_expiry, final_limit = save_subscription(uid, f"Voucher VIP ({days}d)", int(days), int(limit), stack=True)
     bot.reply_to(
         message,
-        f"🎉 **ভাউচার কোড সফলভাবে রিডিম হয়েছে!**\nআপনার অ্যাকাউন্টে `{days}` দিনের VIP প্ল্যান সচল করা হয়েছে।",
+        f"🎉 **ভাউচার কোড সফলভাবে রিডিম হয়েছে!**\n"
+        f"💎 যোগ হয়েছে: `+{days}` দিন | ফাইল লিমিট: `{final_limit}`\n"
+        f"⏳ নতুন মেয়াদ: `{new_expiry.strftime('%Y-%m-%d %H:%M')}`\n"
+        f"📊 কোড ব্যবহার: `{new_used}/{f_max}`",
         parse_mode="Markdown",
     )
 
 
 def _logic_earn_vip(message):
     uid = message.from_user.id
+    if uid not in admin_ids:
+        with DB_LOCK:
+            conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+            c = conn.cursor()
+            c.execute(
+                "SELECT created_at FROM ad_sessions WHERE user_id = ? AND claimed = 1 ORDER BY created_at DESC LIMIT 1",
+                (uid,),
+            )
+            last_claim = c.fetchone()
+            c.execute("SELECT device_hash FROM user_devices WHERE user_id = ?", (uid,))
+            u_dev = c.fetchone()
+            bound_hash = u_dev[0] if (u_dev and u_dev[0]) else ""
+            if bound_hash:
+                c.execute("SELECT owner_user_id, is_blocked FROM device_locks WHERE device_hash = ?", (bound_hash,))
+                dlock = c.fetchone()
+                if dlock and int(dlock[0]) != uid:
+                    conn.close()
+                    log_device_abuse(uid, int(dlock[0]), bound_hash, "earn_vip", "User bound to already-locked device")
+                    bot.reply_to(
+                        message,
+                        f"❌ **SAME-DEVICE MULTI-ACCOUNT BLOCKED!**\nএই ডিভাইসটি অন্য Telegram অ্যাকাউন্ট (`{dlock[0]}`) এর সাথে লক করা আছে।",
+                        parse_mode="Markdown",
+                    )
+                    return
+            conn.close()
+
+        if last_claim and last_claim[0]:
+            try:
+                last_dt = datetime.fromisoformat(last_claim[0])
+                next_allowed = last_dt + timedelta(hours=AD_CLAIM_COOLDOWN_HOURS)
+                if datetime.now() < next_allowed:
+                    rem = next_allowed - datetime.now()
+                    hrs = rem.seconds // 3600
+                    mins = (rem.seconds % 3600) // 60
+                    bot.reply_to(
+                        message,
+                        f"⏳ আপনি ইতিমধ্যে ফ্রি অ্যাড VIP ক্লেইম করেছেন। পরবর্তী ক্লেইম করতে পারবেন `{hrs} ঘণ্টা {mins} মিনিট` পর।",
+                        parse_mode="Markdown",
+                    )
+                    return
+            except Exception:
+                pass
+
     session_token = create_ad_session(uid)
     ad_url = f"{get_base_url()}/ad/{session_token}"
 
@@ -885,7 +1826,7 @@ def _logic_earn_vip(message):
         "━━━━━━━━━━━━━━━━━━━\n"
         "১. **Watch Ad** বাটনে ক্লিক করে অ্যাডটি সম্পন্ন করুন।\n"
         "২. অ্যাড ভেরিফাই হওয়ার পর **Verify Ad & Claim VIP** চাপুন।\n"
-        "*অ্যাড না দেখলে VIP একটিভ বা কোড দেওয়া হবে না।*",
+        "🔒 *একই ডিভাইসে একাধিক Telegram অ্যাকাউন্ট দিয়ে ক্লেইম ব্লক করা হয়েছে।*",
         reply_markup=markup,
         parse_mode="Markdown",
     )
@@ -903,39 +1844,54 @@ def handle_verify_claim(call):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         c = conn.cursor()
-        c.execute("SELECT user_id, verified, claimed FROM ad_sessions WHERE token = ?", (token,))
+        c.execute("SELECT user_id, device_hash, verified, claimed FROM ad_sessions WHERE token = ?", (token,))
         row = c.fetchone()
         if not row:
             conn.close()
             bot.answer_callback_query(call.id, "❌ সেশন পাওয়া যায়নি। আবার Earn VIP চাপুন।", show_alert=True)
             return
 
-        sess_uid, verified, claimed = row
-        if sess_uid != uid:
+        sess_uid, sess_dev_hash, verified, claimed = row
+        if int(sess_uid) != int(uid):
             conn.close()
             bot.answer_callback_query(call.id, "❌ এটি আপনার সেশন নয়!", show_alert=True)
             return
-        if claimed == 1:
+        if int(claimed or 0) == 1:
             conn.close()
             bot.answer_callback_query(call.id, "⚠️ এই অ্যাড সেশন দিয়ে ইতিমধ্যে ক্লেইম করা হয়েছে!", show_alert=True)
             return
-        if verified != 1:
+        if int(verified or 0) != 1:
             conn.close()
             bot.answer_callback_query(call.id, "❌ আপনি এখনো অ্যাড দেখেননি/ভেরিফাই হয়নি! আগে Watch Ad চাপুন।", show_alert=True)
             return
 
-        c.execute("UPDATE ad_sessions SET claimed = 1 WHERE token = ?", (token,))
+        conn.close()
+
+    allowed, _, reason_bn = bind_or_check_device(uid, sess_dev_hash, source="ad_claim", enforce_strict=True)
+    if not allowed:
+        bot.answer_callback_query(call.id, "❌ Same-device multi-account detected!", show_alert=True)
+        bot.send_message(call.message.chat.id, reason_bn, parse_mode="Markdown")
+        return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("UPDATE ad_sessions SET claimed = 1 WHERE token = ? AND claimed = 0", (token,))
+        updated = c.rowcount
         conn.commit()
         conn.close()
 
-    expiry = datetime.now() + timedelta(days=7)
-    save_subscription(uid, "Verified Ad VIP", expiry)
-    bot.answer_callback_query(call.id, "✅ অ্যাড ভেরিফাইড! ৭ দিনের VIP একটিভ হয়েছে।", show_alert=True)
+    if updated <= 0:
+        bot.answer_callback_query(call.id, "⚠️ ইতিমধ্যে ক্লেইম করা হয়েছে!", show_alert=True)
+        return
+
+    new_expiry, final_limit = save_subscription(uid, "Verified Ad VIP", 7, SUBSCRIBED_USER_LIMIT, stack=True)
+    bot.answer_callback_query(call.id, "✅ অ্যাড ভেরিফাইড! ৭ দিনের VIP যুক্ত হয়েছে।", show_alert=True)
     bot.send_message(
         call.message.chat.id,
         "🎉 **AD VERIFIED & VIP ACTIVATED!**\n"
-        "💎 Plan: `7 Days VIP` (Limit: `15 Files`)\n"
-        f"⏳ Expiry: `{expiry.strftime('%Y-%m-%d %H:%M')}`",
+        f"💎 Plan: `7 Days VIP` (Limit: `{final_limit} Files`)\n"
+        f"⏳ New Expiry: `{new_expiry.strftime('%Y-%m-%d %H:%M')}`",
         parse_mode="Markdown",
     )
 
@@ -1117,9 +2073,13 @@ def callbacks(call):
         pid = int(data.split("_")[2])
         plan = get_plan_by_id(pid)
         if plan:
-            save_subscription(uid, plan[1], datetime.now() + timedelta(days=plan[4]))
+            new_exp, _ = save_subscription(uid, plan[1], int(plan[4]), int(plan[2]), stack=True)
             bot.answer_callback_query(call.id, "🎉 Claimed!")
-            bot.send_message(call.message.chat.id, f"🎉 `{plan[1]}` সচল হয়েছে।", parse_mode="Markdown")
+            bot.send_message(
+                call.message.chat.id,
+                f"🎉 `{plan[1]}` সচল হয়েছে।\n⏳ নতুন মেয়াদ: `{new_exp.strftime('%Y-%m-%d %H:%M')}`",
+                parse_mode="Markdown",
+            )
 
     elif data.startswith("buy_binance_"):
         pid = int(data.split("_")[2])
@@ -1240,7 +2200,7 @@ def callbacks(call):
 
     elif data == "add_subscription" and uid in admin_ids:
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "💎 **Format:** `UserID PlanName Days`\nউদাহরণ: `8452462370 VIP 30`", parse_mode="Markdown")
+        msg = bot.send_message(call.message.chat.id, "💎 **Format:** `UserID PlanName Days [FileLimit]`\nউদাহরণ: `8452462370 VIP 30 15`", parse_mode="Markdown")
         bot.register_next_step_handler(msg, handle_add_sub_step)
 
     elif data == "remove_subscription" and uid in admin_ids:
@@ -1248,10 +2208,79 @@ def callbacks(call):
         msg = bot.send_message(call.message.chat.id, "❌ সাবস্ক্রিপশন রিমুভ করতে User ID পাঠান:")
         bot.register_next_step_handler(msg, handle_remove_sub_step)
 
+    elif data == "reset_device" and uid in admin_ids:
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "🔓 যে ইউজারের Device Lock রিসেট করতে চান তার **Telegram User ID** পাঠান:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, handle_reset_device_step)
+
+    elif data == "view_abuse_logs" and uid in admin_ids:
+        bot.answer_callback_query(call.id)
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute(
+            "SELECT user_id, existing_owner_id, action_type, detail, created_at FROM device_abuse_logs ORDER BY id DESC LIMIT 12"
+        )
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            bot.send_message(call.message.chat.id, "✅ কোনো Multi-Account Abuse লগ পাওয়া যায়নি।")
+            return
+        lines = ["🚨 **RECENT DEVICE ABUSE LOGS**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+        for u_id, own_id, act, det, dt in rows:
+            lines.append(f"• Attempt: `{u_id}` | Owner: `{own_id}` | `{act}`\n  _{det}_ (`{dt[:16]}`)")
+        bot.send_message(call.message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
     elif data == "create_voucher" and uid in admin_ids:
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "🎟️ **Format:** `CODE DAYS LIMIT`\nউদাহরণ: `HOSTIFY7 7 15`", parse_mode="Markdown")
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🎟️ **Format:** `CODE DAYS FILE_LIMIT MAX_USES [VALID_HOURS]`\n"
+            "• `CODE`: ভাউচার কোড\n"
+            "• `DAYS`: কত দিনের VIP\n"
+            "• `FILE_LIMIT`: কত ফাইল লিমিট\n"
+            "• `MAX_USES`: মোট কতজন/কতবার ইউজ করতে পারবে\n"
+            "• `VALID_HOURS` *(ঐচ্ছিক)*: কোডটি কত ঘণ্টা ভ্যালিড থাকবে (`0` দিলে আনলিমিটেড)\n\n"
+            "উদাহরণ: `HOSTIFY7 7 15 1 24`",
+            parse_mode="Markdown",
+        )
         bot.register_next_step_handler(msg, handle_create_voucher_step)
+
+    elif data == "gen_bulk_vouchers" and uid in admin_ids:
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            call.message.chat.id,
+            "🎲 **Bulk Random Voucher Generator**\n"
+            "**Format:** `COUNT DAYS FILE_LIMIT MAX_USES [VALID_HOURS]`\n"
+            "উদাহরণ: `5 7 15 1 48` (৫টি র‍্যান্ডম কোড তৈরি হবে)",
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(msg, handle_bulk_vouchers_step)
+
+    elif data == "view_vouchers" and uid in admin_ids:
+        bot.answer_callback_query(call.id)
+        text, markup = build_vouchers_view_payload()
+        bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+    elif data == "clean_vouchers" and uid in admin_ids:
+        removed = clean_inactive_vouchers_db()
+        bot.answer_callback_query(call.id, f"🧹 {removed}টি কোড মুছে ফেলা হয়েছে!", show_alert=True)
+        text, markup = build_vouchers_view_payload()
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("del_vouch_") and uid in admin_ids:
+        v_code = data.replace("del_vouch_", "", 1).strip().upper()
+        if delete_voucher_db(v_code):
+            bot.answer_callback_query(call.id, f"✅ ভাউচার {v_code} ডিলিট হয়েছে!", show_alert=True)
+            text, markup = build_vouchers_view_payload()
+            try:
+                bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            bot.answer_callback_query(call.id, "❌ ভাউচারটি পাওয়া যায়নি!", show_alert=True)
 
     elif data == "add_admin" and uid in admin_ids:
         bot.answer_callback_query(call.id)
@@ -1301,6 +2330,13 @@ def callbacks(call):
 
     elif data == "stats" and uid in admin_ids:
         bot.answer_callback_query(call.id)
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM device_locks")
+        locked_devs = int((c.fetchone() or [0])[0] or 0)
+        c.execute("SELECT COUNT(*) FROM device_abuse_logs")
+        abuse_cnt = int((c.fetchone() or [0])[0] or 0)
+        conn.close()
         bot.send_message(
             call.message.chat.id,
             f"📊 **ENTERPRISE SYSTEM METRICS**\n"
@@ -1308,6 +2344,8 @@ def callbacks(call):
             f"👥 Total Unique Users: `{len(active_users)}`\n"
             f"💎 Active Subscriptions: `{len(user_subscriptions)}`\n"
             f"🚀 Running Bot Instances: `{len(bot_scripts)}`\n"
+            f"🔐 Locked Devices: `{locked_devs}`\n"
+            f"🚨 Multi-Account Blocks: `{abuse_cnt}`\n"
             f"🚫 Blacklisted Users: `{len(banned_users)}`\n"
             f"🛠️ Maintenance Mode: `{'ON' if maintenance_mode else 'OFF'}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1333,8 +2371,13 @@ def handle_add_sub_step(m):
     try:
         parts = m.text.split()
         target_uid, plan_name, days = int(parts[0]), parts[1], int(parts[2])
-        save_subscription(target_uid, plan_name, datetime.now() + timedelta(days=days))
-        bot.reply_to(m, f"✅ ইউজার `{target_uid}` এর জন্য `{days}` দিনের `{plan_name}` সাবস্ক্রিপশন যুক্ত হয়েছে।", parse_mode="Markdown")
+        flim = int(parts[3]) if len(parts) > 3 else SUBSCRIBED_USER_LIMIT
+        new_exp, final_lim = save_subscription(target_uid, plan_name, days, flim, stack=True)
+        bot.reply_to(
+            m,
+            f"✅ ইউজার `{target_uid}` এর জন্য `{days}` দিনের `{plan_name}` (Limit: `{final_lim}`) যুক্ত হয়েছে।\n⏳ মেয়াদ: `{new_exp.strftime('%Y-%m-%d %H:%M')}`",
+            parse_mode="Markdown",
+        )
     except Exception as e:
         bot.reply_to(m, f"❌ Error: {e}")
 
@@ -1344,6 +2387,17 @@ def handle_remove_sub_step(m):
         target_uid = int(m.text.strip())
         remove_subscription_db(target_uid)
         bot.reply_to(m, f"✅ ইউজার `{target_uid}` এর সাবস্ক্রিপশন রিমুভ করা হয়েছে।", parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(m, f"❌ Error: {e}")
+
+
+def handle_reset_device_step(m):
+    try:
+        target_uid = int(m.text.strip())
+        if reset_user_device_db(target_uid):
+            bot.reply_to(m, f"🔓 ইউজার `{target_uid}` এর Device Lock সফলভাবে রিসেট হয়েছে।", parse_mode="Markdown")
+        else:
+            bot.reply_to(m, f"ℹ️ ইউজার `{target_uid}` এর নামে কোনো সেভ করা Device Lock পাওয়া যায়নি।", parse_mode="Markdown")
     except Exception as e:
         bot.reply_to(m, f"❌ Error: {e}")
 
@@ -1360,10 +2414,50 @@ def handle_add_admin_step(m):
 def handle_create_voucher_step(m):
     try:
         parts = m.text.split()
-        code, days = parts[0], int(parts[1])
+        if len(parts) < 2:
+            bot.reply_to(m, "❌ ফরম্যাট: `CODE DAYS FILE_LIMIT MAX_USES [VALID_HOURS]`", parse_mode="Markdown")
+            return
+        code = parts[0].strip().upper()
+        days = int(parts[1])
         limit = int(parts[2]) if len(parts) > 2 else 15
-        create_voucher_db(code, days, limit)
-        bot.reply_to(m, f"🎟️ ভাউচার কোড `{code.upper()}` (`{days}` দিন, Limit `{limit}`) তৈরি হয়েছে!", parse_mode="Markdown")
+        max_uses = int(parts[3]) if len(parts) > 3 else 1
+        valid_hours = int(parts[4]) if len(parts) > 4 else 0
+        create_voucher_db(code, days, limit, max_uses, valid_hours)
+        exp_info = f"{valid_hours} ঘণ্টা" if valid_hours > 0 else "Unlimited"
+        bot.reply_to(
+            m,
+            f"🎟️ ভাউচার কোড `{code}` তৈরি হয়েছে!\n"
+            f"⏱️ VIP মেয়াদ: `{days}` দিন | 📁 Limit: `{limit}` | 👥 Max Uses: `{max_uses}` | ⏳ Code Valid: `{exp_info}`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        bot.reply_to(m, f"❌ Error: {e}")
+
+
+def handle_bulk_vouchers_step(m):
+    try:
+        parts = m.text.split()
+        if len(parts) < 2:
+            bot.reply_to(m, "❌ ফরম্যাট: `COUNT DAYS FILE_LIMIT MAX_USES [VALID_HOURS]` (উদাহরণ: `5 7 15 1 24`)", parse_mode="Markdown")
+            return
+        count = min(30, max(1, int(parts[0])))
+        days = int(parts[1])
+        limit = int(parts[2]) if len(parts) > 2 else 15
+        max_uses = int(parts[3]) if len(parts) > 3 else 1
+        valid_hours = int(parts[4]) if len(parts) > 4 else 0
+        generated = []
+        for _ in range(count):
+            rnd = f"HOST-{secrets.token_hex(3).upper()}"
+            create_voucher_db(rnd, days, limit, max_uses, valid_hours)
+            generated.append(f"`{rnd}`")
+        exp_info = f"{valid_hours}h" if valid_hours > 0 else "No Expiry"
+        bot.reply_to(
+            m,
+            f"🎲 **{count}টি র‍্যান্ডম ভাউচার তৈরি হয়েছে!**\n"
+            f"⏱️ VIP: `{days}d` | 📁 Limit: `{limit}` | 👥 Uses: `{max_uses}` | ⏳ Valid: `{exp_info}`\n\n"
+            + "\n".join(generated),
+            parse_mode="Markdown",
+        )
     except Exception as e:
         bot.reply_to(m, f"❌ Error: {e}")
 
@@ -1413,8 +2507,12 @@ def process_txid(message, pid):
     is_free = (float(nums[0]) == 0) if nums else False
     if valid or is_free:
         add_used_txid(tx)
-        save_subscription(uid, plan[1], datetime.now() + timedelta(days=plan[4]))
-        bot.reply_to(message, f"🎉 Payment Verified! `{plan[1]}` সচল হয়েছে।", parse_mode="Markdown")
+        new_exp, _ = save_subscription(uid, plan[1], int(plan[4]), int(plan[2]), stack=True)
+        bot.reply_to(
+            message,
+            f"🎉 Payment Verified! `{plan[1]}` সচল হয়েছে।\n⏳ নতুন মেয়াদ: `{new_exp.strftime('%Y-%m-%d %H:%M')}`",
+            parse_mode="Markdown",
+        )
     else:
         bot.reply_to(message, "❌ Binance Pay হিস্টোরিতে এই TxID পাওয়া যায়নি।")
 
